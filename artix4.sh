@@ -10,6 +10,10 @@ set -u  # Treat unset variables as errors
 DISK=""
 BOOT_SIZE=""
 SWAP_SIZE=""
+REGION=""
+CITY=""
+HOSTNAME=""
+
 
 # Functions
 check_root() {
@@ -306,7 +310,12 @@ show_configuration_info() {
     echo "4. Install and configure bootloader"
     echo ""
     echo "Example GRUB configuration:"
-    echo "GRUB_CMDLINE_LINUX_DEFAULT=\"cryptdevice=UUID=$(blkid -s UUID -o value ${DISK}1):lvm-system:allow-discards loglevel=3 quiet resume=UUID=$SWAP_UUID net.ifnames=0\""
+
+
+
+    echo "GRUB_CMDLINE_LINUX_DEFAULT=\"cryptdevice=UUID=$(blkid -s UUID -o value ${DISK}1):lvm-system:allow-discards UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volRoot):root loglevel=3 quiet resume=UUID=$(blkid -s UUID -o /dev/mapper/lvmSystem-volSwap) net.ifnames=0\""
+
+
 }
 
 show_cleanup_commands() {
