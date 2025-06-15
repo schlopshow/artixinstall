@@ -355,7 +355,6 @@ mount_partitions() {
 
 install_base_system() {
     print_header "Changing Pacman for speed"
-    # FIXED: Corrected sed command syntax
     sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
     print_header "SYSTEM INSTALLATION"
 
@@ -483,7 +482,6 @@ cp /etc/mkinitcpio.conf /etc/mkinitcpio.conf.backup
 sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt keyboard keymap consolefont lvm2 filesystems fsck)/' /etc/mkinitcpio.conf
 
 # Generate initramfs
-mkinitcpio -P
 print_success "mkinitcpio configured and initramfs generated"
 
 # Configure GRUB
@@ -583,13 +581,8 @@ ln -s /etc/runit/sv/NetworkManager /etc/runit/runsvdir/default/
 print_success "NetworkManager enabled"
 
 print_success "Chroot configuration completed!"
-print_header "POST-INSTALLATION RECOMMENDATIONS"
-echo "After reboot, consider these additional steps:"
-echo "1. Create a regular user account"
-echo "2. Install and configure a desktop environment"
-echo "3. Install additional software"
-echo "4. Configure firewall"
-echo "5. Update the system: pacman -Syu"
+print_header "Recompiling Kernel"
+mkinitcpio -P
 
 CHROOT_EOF
 
@@ -624,25 +617,9 @@ show_completion_info() {
     echo "  - volBoot ($BOOT_SIZE) - FAT32"
     echo "  - volSwap ($SWAP_SIZE)"
     echo "  - volRoot (remaining space) - BTRFS"
-    echo ""
-    echo "Important UUIDs:"
-    echo "Encrypted partition UUID: $(blkid -s UUID -o value $PARTITION)"
-    echo "Swap UUID: $SWAP_UUID"
-    echo ""
 
     print_success "Artix Linux installation completed successfully!"
     print_info "You can now reboot into your new system."
-    print_warning "Don't forget to:"
-    echo "1. Remove installation media"
-    echo "2. Create a regular user account after first boot"
-    echo "3. Update the system: pacman -Syu"
-    echo ""
-    echo "Cleanup commands (if needed):"
-    echo "  umount -R /mnt"
-    echo "  swapoff -a"
-    echo "  vgchange -an lvmSystem"
-    echo "  cryptsetup luksClose lvm-system"
-    echo "  sync"
 }
 
 #=============================================================================
