@@ -487,7 +487,6 @@ print_success "mkinitcpio configured and initramfs generated"
 print_header "BOOTLOADER CONFIGURATION"
 
 # Get UUIDs - handle nvme vs sda naming
-local PARTITION_NAME
 if [[ "$DISK_NAME" =~ nvme[0-9]+n[0-9]+ ]]; then
     PARTITION_NAME="/dev/${DISK_NAME}p1"
 else
