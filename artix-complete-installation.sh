@@ -354,6 +354,8 @@ mount_partitions() {
 #=============================================================================
 
 install_base_system() {
+    print_header "Changing Pacman for speed"
+    sed -i "\s/^\#ParallelDownloads.*/ParallelDownloads = 5 /" /etc/pacman.conf
     print_header "SYSTEM INSTALLATION"
 
     print_info "Installing base system packages..."
