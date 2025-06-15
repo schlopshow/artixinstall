@@ -38,25 +38,14 @@ A comprehensive, automated installation script for Artix Linux with full disk en
 
 ## Installation Process
 
-### 1. Download and Prepare
 ```bash
 # Download the script (if available online)
-curl -O https://example.com/artix-complete-install.sh
+curl -O https://github.com/schlopshow/artixinstall/artix-complete-install.sh
 
-# Or create the script file manually and copy the content
-nano artix-complete-install.sh
 chmod +x artix-complete-install.sh
+
+bash artix-complete-install.sh
 ```
-
-### 2. Run the Script
-```bash
-sudo ./artix-complete-install.sh
-```
-
-### 3. Follow Interactive Prompts
-
-The script will guide you through:
-
 #### Disk Configuration
 - Select target disk from available devices
 - Configure boot partition size (e.g., `1G`)
@@ -89,56 +78,6 @@ The script will guide you through:
 3. **Boot Configuration**: mkinitcpio and GRUB setup
 4. **User Setup**: Root password configuration
 5. **Services**: NetworkManager enablement
-
-## Configuration Details
-
-### Encryption Specifications
-- **Type**: LUKS1
-- **Cipher**: serpent-xts-plain64
-- **Key Size**: 512 bits
-- **Hash**: SHA512
-- **Iteration Time**: 10000ms
-- **Random Source**: /dev/random
-
-### LVM Layout
-```
-/dev/mapper/lvm-system (LUKS container)
-├── lvmSystem-volBoot  → /boot (FAT32)
-├── lvmSystem-volSwap  → swap
-└── lvmSystem-volRoot  → / (BTRFS)
-```
-
-
-### Recommended Next Steps
-1. **Create regular user account**:
-   ```bash
-   useradd -m -G wheel -s /bin/bash username
-   passwd username
-   ```
-
-2. **Configure sudo**:
-   ```bash
-   EDITOR=vim visudo
-   # Uncomment: %wheel ALL=(ALL:ALL) ALL
-   ```
-
-3. **Update system**:
-   ```bash
-   pacman -Syu
-   ```
-
-4. **Install desktop environment**:
-   ```bash
-   # Example for XFCE
-   pacman -S xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
-   ln -s /etc/runit/sv/lightdm /etc/runit/runsvdir/default/
-   ```
-
-5. **Configure firewall**:
-   ```bash
-   pacman -S ufw
-   ufw enable
-   ```
 
 ## Troubleshooting
 
@@ -183,19 +122,6 @@ cryptsetup luksClose lvm-system
 sync
 ```
 
-## Security Considerations
-
-### Strengths
-- Strong encryption (Serpent cipher, 512-bit key)
-- Secure random number generation
-- Optional secure disk erasure
-- Encrypted swap partition
-
-### Limitations
-- LUKS1 (older version, but widely supported)
-- Single point of failure (forgotten passphrase)
-- Cold boot attacks (physical access)
-
 ### Best Practices
 - Use a strong, memorable passphrase
 - Consider key file backup on separate media
@@ -213,8 +139,6 @@ Feel free to submit issues, suggestions, or improvements. Always test changes in
 ## Disclaimer
 
 This script performs destructive operations on disk drives. The authors are not responsible for any data loss or system damage. Always backup important data and test in a virtual environment first.
-
-
 
 
 ## To Do List
