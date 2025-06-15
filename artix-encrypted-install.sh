@@ -355,7 +355,8 @@ mount_partitions() {
 
 install_base_system() {
     print_header "Changing Pacman for speed"
-    sed -i "\s/^\#ParallelDownloads.*/ParallelDownloads = 5 /" /etc/pacman.conf
+    # FIXED: Corrected sed command syntax
+    sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
     print_header "SYSTEM INSTALLATION"
 
     print_info "Installing base system packages..."
@@ -519,10 +520,13 @@ if [[ -n "$SWAP_UUID" ]]; then
 fi
 GRUB_CMDLINE="${GRUB_CMDLINE} net.ifnames=0"
 
-# Update GRUB_CMDLINE_LINUX_DEFAULT
-sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE}\"/" /etc/default/grub
-sed -i "s/^GRUB_PRELOAD_MODULES=.*/GRUB_PRELOAD_MODULES=\"part_gpt part_msdos cryptodisk\"/" /etc/default/grub
-sed -i "s/^\#GRUB_ENABLE_CRYPTODISK=.*/GRUB_ENABLE_CRYPTODISK=y/" /etc/default/grub
+# FIXED: Escape special characters and use safer delimiters
+GRUB_CMDLINE_ESCAPED=$(printf '%s\n' "$GRUB_CMDLINE" | sed 's/[[\.*^$()+?{|]/\\&/g')
+
+# Update GRUB configuration with safer sed commands
+sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE_ESCAPED}\"|" /etc/default/grub
+sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos cryptodisk"|' /etc/default/grub
+sed -i 's|^#GRUB_ENABLE_CRYPTODISK=.*|GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
 print_success "GRUB configuration updated"
 
 # Determine boot mode
