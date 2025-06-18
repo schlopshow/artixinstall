@@ -18,6 +18,7 @@ DISK=""
 BOOT_SIZE=""
 SWAP_SIZE=""
 SWAP_UUID=""
+BOOT_ENCRYPTED="true"  # Default to encrypted boot
 
 # Output functions
 print_info() {
@@ -109,6 +110,31 @@ get_disk_configuration() {
         fi
     done
 
+    # Ask about boot partition encryption
+    print_header "BOOT PARTITION CONFIGURATION"
+    echo "Choose boot partition setup:"
+    echo "1. Encrypted boot (inside LVM) - More secure but potentially more complex"
+    echo "2. Unencrypted boot (separate partition) - Simpler, widely compatible"
+    echo ""
+    while true; do
+        read -p "Select option (1 or 2): " boot_choice
+        case $boot_choice in
+            1)
+                BOOT_ENCRYPTED="true"
+                print_info "Selected: Encrypted boot partition (inside LVM)"
+                break
+                ;;
+            2)
+                BOOT_ENCRYPTED="false"
+                print_info "Selected: Unencrypted boot partition (separate)"
+                break
+                ;;
+            *)
+                print_error "Invalid choice. Please enter 1 or 2."
+                ;;
+        esac
+    done
+
     # Get partition sizes
     echo ""
     echo "Enter partition sizes (you can use units like G for gigabytes, M for megabytes):"
@@ -134,6 +160,11 @@ confirm_configuration() {
     print_header "CONFIGURATION SUMMARY"
     echo "Disk: $DISK"
     echo "Boot partition size: $BOOT_SIZE"
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        echo "Boot partition: Encrypted (inside LVM)"
+    else
+        echo "Boot partition: Unencrypted (separate partition)"
+    fi
     echo "Swap partition size: $SWAP_SIZE"
     echo "Root partition: Uses remaining space"
     echo "Root filesystem: BTRFS"
@@ -228,27 +259,52 @@ erase_disk() {
     print_success "Disk erasure completed."
 }
 
-create_partition() {
-    print_info "Creating partition on $DISK..."
-    parted -s "$DISK" mklabel msdos
-    parted -s -a optimal "$DISK" mkpart "primary" "btrfs" "0%" "100%"
-    parted -s "$DISK" set 1 boot on
-    parted -s "$DISK" set 1 lvm on
+create_partitions() {
+    print_info "Creating partitions on $DISK..."
+
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        # Single partition for encrypted LVM (original behavior)
+        parted -s "$DISK" mklabel msdos
+        parted -s -a optimal "$DISK" mkpart "primary" "btrfs" "0%" "100%"
+        parted -s "$DISK" set 1 boot on
+        parted -s "$DISK" set 1 lvm on
+    else
+        # Two partitions: unencrypted boot + encrypted LVM
+        parted -s "$DISK" mklabel msdos
+        # Boot partition
+        parted -s -a optimal "$DISK" mkpart "primary" "fat32" "0%" "$BOOT_SIZE"
+        parted -s "$DISK" set 1 boot on
+        # LVM partition (rest of disk)
+        parted -s -a optimal "$DISK" mkpart "primary" "ext4" "$BOOT_SIZE" "100%"
+        parted -s "$DISK" set 2 lvm on
+    fi
+
     parted -s "$DISK" print
 
     # Verify alignment
     local alignment_ok
     alignment_ok=$(parted -s "$DISK" align-check optimal 1)
-    print_info "Partition alignment: $alignment_ok"
+    print_info "Partition 1 alignment: $alignment_ok"
+
+    if [[ "$BOOT_ENCRYPTED" == "false" ]]; then
+        alignment_ok=$(parted -s "$DISK" align-check optimal 2)
+        print_info "Partition 2 alignment: $alignment_ok"
+    fi
 
     # Flush partition table to disk
     partprobe "$DISK"
     sync
 
-    # Wait for partition to be recognized
+    # Wait for partitions to be recognized
     sleep 2
 
-    print_success "Partition created: ${DISK}1"
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        print_success "Single partition created for encrypted setup: ${DISK}1"
+    else
+        print_success "Partitions created:"
+        print_success "  Boot (unencrypted): ${DISK}1"
+        print_success "  LVM (to be encrypted): ${DISK}2"
+    fi
 }
 
 setup_encryption() {
@@ -265,27 +321,37 @@ setup_encryption() {
     print_info "Running encryption benchmark..."
     cryptsetup benchmark
 
+    # Determine which partition to encrypt
+    local ENCRYPT_PARTITION
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        # Encrypt the single partition
+        if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
+            ENCRYPT_PARTITION="${DISK}p1"
+        else
+            ENCRYPT_PARTITION="${DISK}1"
+        fi
+    else
+        # Encrypt the second partition (LVM partition)
+        if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
+            ENCRYPT_PARTITION="${DISK}p2"
+        else
+            ENCRYPT_PARTITION="${DISK}2"
+        fi
+    fi
+
     # Create LUKS container
     echo ""
-    print_info "Creating LUKS container on ${DISK}1..."
+    print_info "Creating LUKS container on $ENCRYPT_PARTITION..."
     print_warning "You will be prompted to enter a passphrase for disk encryption."
     print_warning "IMPORTANT: Choose a strong passphrase and remember it - you'll need it to boot your system!"
     echo ""
 
-    # Determine partition name (handle nvme vs sda naming)
-    local PARTITION
-    if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
-        PARTITION="${DISK}p1"
-    else
-        PARTITION="${DISK}1"
-    fi
-
     cryptsetup --verbose --type luks1 --cipher serpent-xts-plain64 --key-size 512 \
-               --hash sha512 --iter-time 10000 --use-random --verify-passphrase luksFormat "$PARTITION"
+               --hash sha512 --iter-time 10000 --use-random --verify-passphrase luksFormat "$ENCRYPT_PARTITION"
 
     # Open LUKS container
     print_info "Opening LUKS container..."
-    cryptsetup luksOpen "$PARTITION" lvm-system
+    cryptsetup luksOpen "$ENCRYPT_PARTITION" lvm-system
 
     print_success "Encryption setup completed. LUKS container is now open as /dev/mapper/lvm-system"
 }
@@ -295,11 +361,19 @@ setup_lvm() {
     pvcreate /dev/mapper/lvm-system
     vgcreate lvmSystem /dev/mapper/lvm-system
 
-    # Create logical volumes with user-specified sizes
+    # Create logical volumes based on boot encryption choice
     print_info "Creating logical volumes..."
-    lvcreate --contiguous y --size "$BOOT_SIZE" lvmSystem --name volBoot
-    lvcreate --contiguous y --size "$SWAP_SIZE" lvmSystem --name volSwap
-    lvcreate --contiguous y --extents +100%FREE lvmSystem --name volRoot
+
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        # Original behavior: boot inside LVM
+        lvcreate --contiguous y --size "$BOOT_SIZE" lvmSystem --name volBoot
+        lvcreate --contiguous y --size "$SWAP_SIZE" lvmSystem --name volSwap
+        lvcreate --contiguous y --extents +100%FREE lvmSystem --name volRoot
+    else
+        # New behavior: no boot in LVM (boot is separate unencrypted partition)
+        lvcreate --contiguous y --size "$SWAP_SIZE" lvmSystem --name volSwap
+        lvcreate --contiguous y --extents +100%FREE lvmSystem --name volRoot
+    fi
 
     # Show created volumes
     print_info "Created logical volumes:"
@@ -311,9 +385,21 @@ setup_lvm() {
 format_partitions() {
     print_info "Formatting partitions..."
 
-    # Format boot partition as FAT32
-    print_info "Formatting boot partition (FAT32)..."
-    mkfs.fat -F32 -n BOOT /dev/lvmSystem/volBoot
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        # Format boot partition inside LVM as FAT32
+        print_info "Formatting encrypted boot partition (FAT32)..."
+        mkfs.fat -F32 -n BOOT /dev/lvmSystem/volBoot
+    else
+        # Format separate unencrypted boot partition as FAT32
+        print_info "Formatting unencrypted boot partition (FAT32)..."
+        local BOOT_PARTITION
+        if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
+            BOOT_PARTITION="${DISK}p1"
+        else
+            BOOT_PARTITION="${DISK}1"
+        fi
+        mkfs.fat -F32 -n BOOT "$BOOT_PARTITION"
+    fi
 
     # Create swap partition
     print_info "Creating swap partition..."
@@ -341,12 +427,28 @@ mount_partitions() {
 
     # Create boot directory and mount boot partition
     mkdir -p /mnt/boot
-    mount /dev/lvmSystem/volBoot /mnt/boot
 
-    print_success "Partitions mounted successfully:"
-    echo "  Root (BTRFS): /mnt"
-    echo "  Boot (FAT32): /mnt/boot"
-    echo "  Swap: activated"
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        # Mount encrypted boot from LVM
+        mount /dev/lvmSystem/volBoot /mnt/boot
+        print_success "Partitions mounted successfully:"
+        echo "  Root (BTRFS): /mnt"
+        echo "  Boot (FAT32, encrypted): /mnt/boot"
+        echo "  Swap: activated"
+    else
+        # Mount unencrypted boot partition
+        local BOOT_PARTITION
+        if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
+            BOOT_PARTITION="${DISK}p1"
+        else
+            BOOT_PARTITION="${DISK}1"
+        fi
+        mount "$BOOT_PARTITION" /mnt/boot
+        print_success "Partitions mounted successfully:"
+        echo "  Root (BTRFS): /mnt"
+        echo "  Boot (FAT32, unencrypted): /mnt/boot"
+        echo "  Swap: activated"
+    fi
 }
 
 #=============================================================================
@@ -487,14 +589,30 @@ print_success "mkinitcpio configured and initramfs generated"
 # Configure GRUB
 print_header "BOOTLOADER CONFIGURATION"
 
-# Get UUIDs - handle nvme vs sda naming
-if [[ "$DISK_NAME" =~ nvme[0-9]+n[0-9]+ ]]; then
-    PARTITION_NAME="/dev/${DISK_NAME}p1"
+# Determine which partition contains the encrypted LVM
+# Check if volBoot exists to determine boot setup
+if lvdisplay /dev/lvmSystem/volBoot &>/dev/null; then
+    BOOT_ENCRYPTED="true"
+    print_info "Detected encrypted boot setup"
+    # Encrypted partition is partition 1
+    if [[ "$DISK_NAME" =~ nvme[0-9]+n[0-9]+ ]]; then
+        CRYPT_PARTITION="/dev/${DISK_NAME}p1"
+    else
+        CRYPT_PARTITION="/dev/${DISK_NAME}1"
+    fi
 else
-    PARTITION_NAME="/dev/${DISK_NAME}1"
+    BOOT_ENCRYPTED="false"
+    print_info "Detected unencrypted boot setup"
+    # Encrypted partition is partition 2
+    if [[ "$DISK_NAME" =~ nvme[0-9]+n[0-9]+ ]]; then
+        CRYPT_PARTITION="/dev/${DISK_NAME}p2"
+    else
+        CRYPT_PARTITION="/dev/${DISK_NAME}2"
+    fi
 fi
 
-CRYPT_UUID=$(blkid -s UUID -o value "$PARTITION_NAME")
+# Get UUIDs
+CRYPT_UUID=$(blkid -s UUID -o value "$CRYPT_PARTITION")
 ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volRoot)
 SWAP_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volSwap)
 
@@ -507,6 +625,7 @@ print_info "Found UUIDs:"
 echo "  Encrypted partition: $CRYPT_UUID"
 echo "  Root partition: $ROOT_UUID"
 echo "  Swap partition: $SWAP_UUID"
+echo "  Boot encrypted: $BOOT_ENCRYPTED"
 
 # Backup original GRUB config
 cp /etc/default/grub /etc/default/grub.backup
@@ -523,8 +642,17 @@ GRUB_CMDLINE_ESCAPED=$(printf '%s\n' "$GRUB_CMDLINE" | sed 's/[[\.*^$()+?{|]/\\&
 
 # Update GRUB configuration with safer sed commands
 sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE_ESCAPED}\"|" /etc/default/grub
-sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos cryptodisk"|' /etc/default/grub
-sed -i 's|^#GRUB_ENABLE_CRYPTODISK=.*|GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
+
+# Only enable cryptodisk for encrypted boot
+if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+    sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos cryptodisk"|' /etc/default/grub
+    sed -i 's|^#GRUB_ENABLE_CRYPTODISK=.*|GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
+else
+    # For unencrypted boot, we don't need cryptodisk in GRUB
+    sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos"|' /etc/default/grub
+    sed -i 's|^GRUB_ENABLE_CRYPTODISK=.*|#GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
+fi
+
 print_success "GRUB configuration updated"
 
 # Determine boot mode
@@ -602,24 +730,41 @@ execute_chroot_configuration() {
 show_completion_info() {
     print_header "INSTALLATION COMPLETED"
 
-    # Determine partition name (handle nvme vs sda naming)
-    local PARTITION
-    if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
-        PARTITION="${DISK}p1"
+    # Determine partition names and layout info
+    local BOOT_INFO
+    local CRYPT_PARTITION
+
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        BOOT_INFO="volBoot ($BOOT_SIZE) - FAT32 (encrypted, inside LVM)"
+        if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
+            CRYPT_PARTITION="${DISK}p1"
+        else
+            CRYPT_PARTITION="${DISK}1"
+        fi
     else
-        PARTITION="${DISK}1"
+        BOOT_INFO="Separate unencrypted partition ($BOOT_SIZE) - FAT32"
+        if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
+            CRYPT_PARTITION="${DISK}p2"
+        else
+            CRYPT_PARTITION="${DISK}2"
+        fi
     fi
 
     echo "Disk: $DISK"
-    echo "Encryption: LUKS1 with Serpent-XTS-Plain64"
+    echo "Encryption: LUKS1 with Serpent-XTS-Plain64 on $CRYPT_PARTITION"
     echo "LVM Volume Group: lvmSystem"
-    echo "Logical Volumes:"
-    echo "  - volBoot ($BOOT_SIZE) - FAT32"
+    echo "Partitions/Volumes:"
+    echo "  - Boot: $BOOT_INFO"
     echo "  - volSwap ($SWAP_SIZE)"
     echo "  - volRoot (remaining space) - BTRFS"
 
     print_success "Artix Linux installation completed successfully!"
     print_info "You can now reboot into your new system."
+
+    if [[ "$BOOT_ENCRYPTED" == "false" ]]; then
+        print_info "Note: Your boot partition is unencrypted for compatibility."
+        print_info "The root and swap partitions are fully encrypted."
+    fi
 }
 
 #=============================================================================
@@ -652,7 +797,7 @@ main() {
         quick_erase
     fi
 
-    create_partition
+    create_partitions
     setup_encryption
     setup_lvm
     format_partitions
