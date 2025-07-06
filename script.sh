@@ -763,168 +763,10 @@ configure_user_settings() {
         fi
     fi
 
-    # Generate initramfs
-    print_info "Generating initramfs..."
-    if artix-chroot /mnt mkinitcpio -P; then
-        print_success "Initramfs generated successfully"
-    else
-        print_error "Failed to generate initramfs"
-        exit 1
-    fi
+   artix-chroot /mnt /bin/bash -c "mkinitcpio -P"
 }
 
-create_user_account() {
-    print_header "CREATE USER ACCOUNT"
 
-    # Ask if user wants to create a user account
-    while true; do
-        read -p "Do you want to create a user account? (Y/n): " create_user
-        case $create_user in
-            [Yy]* | "" )
-                break
-                ;;
-            [Nn]* )
-                print_info "Skipping user account creation."
-                return 0
-                ;;
-            * )
-                print_error "Please answer yes or no."
-                ;;
-        esac
-    done
-
-    # Get username
-    while true; do
-        read -p "Enter username: " username
-        if [[ -n "$username" ]] && [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-            break
-        else
-            print_error "Invalid username. Use only lowercase letters, numbers, underscore, and hyphen."
-            print_error "Must start with a letter or underscore."
-        fi
-    done
-
-    # Create user account
-    print_info "Creating user account '$username'..."
-    if artix-chroot /mnt useradd -m -G wheel -s /bin/bash "$username"; then
-        print_success "User account '$username' created"
-    else
-        print_error "Failed to create user account"
-        exit 1
-    fi
-
-    # Set user password
-    print_info "Setting password for user '$username'..."
-    while true; do
-        if artix-chroot /mnt passwd "$username"; then
-            print_success "Password set for user '$username'"
-            break
-        else
-            print_error "Failed to set password. Please try again."
-            read -p "Do you want to try again? (y/n): " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                print_warning "Skipping password setup for '$username'. You can set it later."
-                break
-            fi
-        fi
-    done
-
-    # Configure sudo
-    print_info "Configuring sudo for wheel group..."
-    artix-chroot /mnt /bin/bash -c "echo '%wheel ALL=(ALL) ALL' >> /etc/sudoers"
-    print_success "Sudo configured for wheel group"
-}
-
-install_additional_packages() {
-    print_header "ADDITIONAL PACKAGES"
-
-    # Ask if user wants to install additional packages
-    while true; do
-        read -p "Do you want to install additional packages? (Y/n): " install_extra
-        case $install_extra in
-            [Yy]* | "" )
-                break
-                ;;
-            [Nn]* )
-                print_info "Skipping additional package installation."
-                return 0
-                ;;
-            * )
-                print_error "Please answer yes or no."
-                ;;
-        esac
-    done
-
-    # Common package categories
-    echo "Select package categories to install:"
-    echo "1) Desktop Environment (XFCE)"
-    echo "2) Development Tools (git, gcc, make, etc.)"
-    echo "3) System Tools (htop, neofetch, tree, etc.)"
-    echo "4) Media Tools (ffmpeg, mpv, etc.)"
-    echo "5) Web Browser (firefox)"
-    echo "6) All of the above"
-    echo "7) Custom package list"
-    echo "8) Skip"
-
-    while true; do
-        read -p "Enter your choice (1-8): " pkg_choice
-        case $pkg_choice in
-            1)
-                EXTRA_PACKAGES="xfce4 xfce4-goodies lightdm lightdm-runit lightdm-gtk-greeter"
-                break
-                ;;
-            2)
-                EXTRA_PACKAGES="git gcc make cmake python python-pip nodejs npm"
-                break
-                ;;
-            3)
-                EXTRA_PACKAGES="htop neofetch tree unzip zip wget curl rsync"
-                break
-                ;;
-            4)
-                EXTRA_PACKAGES="ffmpeg mpv vlc gimp"
-                break
-                ;;
-            5)
-                EXTRA_PACKAGES="firefox"
-                break
-                ;;
-            6)
-                EXTRA_PACKAGES="xfce4 xfce4-goodies lightdm lightdm-runit lightdm-gtk-greeter git gcc make cmake python python-pip nodejs npm htop neofetch tree unzip zip wget curl rsync ffmpeg mpv vlc gimp firefox"
-                break
-                ;;
-            7)
-                read -p "Enter package names separated by spaces: " EXTRA_PACKAGES
-                break
-                ;;
-            8)
-                print_info "Skipping additional package installation."
-                return 0
-                ;;
-            *)
-                print_error "Invalid choice. Please enter 1-8."
-                ;;
-        esac
-    done
-
-    # Install packages
-    if [[ -n "$EXTRA_PACKAGES" ]]; then
-        print_info "Installing additional packages: $EXTRA_PACKAGES"
-        if artix-chroot /mnt pacman -S --noconfirm $EXTRA_PACKAGES; then
-            print_success "Additional packages installed successfully"
-
-            # Enable lightdm if desktop environment was installed
-            if [[ "$EXTRA_PACKAGES" == *"lightdm"* ]]; then
-                print_info "Enabling lightdm display manager..."
-                artix-chroot /mnt ln -s /etc/runit/sv/lightdm /etc/runit/runsvdir/default/ 2>/dev/null || true
-                print_success "Lightdm enabled"
-            fi
-        else
-            print_warning "Some packages may have failed to install. Check the output above."
-        fi
-    fi
-}
 
 cleanup_and_finish() {
     print_header "CLEANUP AND FINISH"
@@ -1015,8 +857,6 @@ main() {
     configure_system
     configure_bootloader
     configure_user_settings
-    create_user_account
-    install_additional_packages
 
     # Cleanup and finish
     cleanup_and_finish
