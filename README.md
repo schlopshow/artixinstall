@@ -127,7 +127,3 @@ This script is provided as-is for educational and personal use. Use at your own 
 
 ## To Do List
 I need to add the ability to choose which init system your using, I also want to have the same interactive installtion that for example debian has.
-
-
-## Why?
-I made this script to make my life slightly easier because I like using artix, using a rolling release distro without understanding how to fix things is a mistake.
