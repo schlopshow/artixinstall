@@ -491,6 +491,7 @@ NC='\033[0m'
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_header() { echo -e "${BLUE}===== $1 =====${NC}"; }
 
 get_user_input() {
@@ -517,76 +518,159 @@ validate_disk() {
     [[ -b "/dev/$1" ]]
 }
 
-# Get timezone from user
+validate_hostname() {
+    # Check if hostname is valid (RFC 1123)
+    if [[ ${#1} -gt 63 ]]; then
+        print_error "Hostname too long (max 63 characters)"
+        return 1
+    fi
+    if [[ ! "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+        print_error "Invalid hostname format. Use only letters, numbers, and hyphens. Cannot start or end with hyphen."
+        return 1
+    fi
+    return 0
+}
+
+# Get timezone from user with better error handling
 print_header "TIMEZONE CONFIGURATION"
 echo "Available regions:"
 ls /usr/share/zoneinfo/ | grep -E '^[A-Z]' | head -10
 echo "..."
-get_user_input "Enter your region (e.g., America, Europe, Asia)" REGION
-if [[ ! -d "/usr/share/zoneinfo/$REGION" ]]; then
-    print_error "Invalid region"
-    exit 1
-fi
+
+while true; do
+    get_user_input "Enter your region (e.g., America, Europe, Asia)" REGION
+    if [[ -d "/usr/share/zoneinfo/$REGION" ]]; then
+        break
+    else
+        print_error "Invalid region '$REGION'. Please choose from available regions."
+        echo "Available regions:"
+        ls /usr/share/zoneinfo/ | grep -E '^[A-Z]' | head -20
+        echo "..."
+    fi
+done
 
 echo "Available cities in $REGION:"
 ls "/usr/share/zoneinfo/$REGION" | head -10
 echo "..."
-get_user_input "Enter your city" CITY
-TIMEZONE="$REGION/$CITY"
 
-if validate_timezone "$TIMEZONE"; then
-    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
-    print_success "Timezone set to $TIMEZONE"
+while true; do
+    get_user_input "Enter your city" CITY
+    TIMEZONE="$REGION/$CITY"
+
+    if validate_timezone "$TIMEZONE"; then
+        if ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime; then
+            print_success "Timezone set to $TIMEZONE"
+            break
+        else
+            print_error "Failed to set timezone. Please try again."
+        fi
+    else
+        print_error "Invalid city '$CITY' for region '$REGION'."
+        echo "Available cities in $REGION:"
+        ls "/usr/share/zoneinfo/$REGION" | head -20
+        echo "..."
+    fi
+done
+
+# Sync hardware clock with error handling
+print_info "Syncing hardware clock..."
+if hwclock --systohc 2>/dev/null; then
+    print_success "Hardware clock synced"
 else
-    print_error "Invalid timezone"
-    exit 1
+    print_warning "Failed to sync hardware clock. This may not be critical."
 fi
 
-# Sync hardware clock
-print_info "Syncing hardware clock..."
-hwclock --systohc
-print_success "Hardware clock synced"
-
-# Set up locale
+# Set up locale with error handling
 print_header "LOCALE CONFIGURATION"
-cat > /etc/locale.conf << 'LOCALE_EOF'
+if cat > /etc/locale.conf << 'LOCALE_EOF'
 LANG=en_US.UTF-8
 export LC_COLLATE="C"
 LOCALE_EOF
+then
+    print_info "Locale configuration file created"
+else
+    print_error "Failed to create locale configuration"
+    exit 1
+fi
 
-echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-locale-gen
-print_success "Locale configured"
+if echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; then
+    print_info "Locale added to locale.gen"
+else
+    print_error "Failed to update locale.gen"
+    exit 1
+fi
 
-# Get hostname
+if locale-gen; then
+    print_success "Locale configured"
+else
+    print_error "Failed to generate locale"
+    exit 1
+fi
+
+# Get hostname with validation
 print_header "HOSTNAME CONFIGURATION"
-get_user_input "Enter hostname for this system" HOSTNAME
+while true; do
+    get_user_input "Enter hostname for this system" HOSTNAME validate_hostname
+    if validate_hostname "$HOSTNAME"; then
+        break
+    fi
+done
 
-echo "$HOSTNAME" > /etc/hostname
+if echo "$HOSTNAME" > /etc/hostname; then
+    print_info "Hostname file created"
+else
+    print_error "Failed to create hostname file"
+    exit 1
+fi
 
-# Set up hosts file
-cat > /etc/hosts << HOSTS_EOF
+# Set up hosts file with error handling
+if cat > /etc/hosts << HOSTS_EOF
 127.0.0.1    localhost
 ::1          localhost
 127.0.1.1    $HOSTNAME.localdomain $HOSTNAME
 HOSTS_EOF
-print_success "Hostname set to $HOSTNAME"
+then
+    print_success "Hostname set to $HOSTNAME"
+else
+    print_error "Failed to create hosts file"
+    exit 1
+fi
 
-# Get disk for bootloader
-get_user_input "Enter the disk device name for bootloader (e.g., sda, nvme0n1)" DISK_NAME validate_disk
+# Get disk for bootloader with better validation
+print_header "DISK CONFIGURATION"
+echo "Available disks:"
+lsblk -d -o NAME,SIZE,MODEL | grep -E '^[a-z]'
+echo ""
 
-# Configure mkinitcpio
+while true; do
+    get_user_input "Enter the disk device name for bootloader (e.g., sda, nvme0n1)" DISK_NAME
+    if validate_disk "$DISK_NAME"; then
+        print_success "Selected disk: /dev/$DISK_NAME"
+        break
+    else
+        print_error "Invalid disk device '/dev/$DISK_NAME'. Please choose from available disks:"
+        lsblk -d -o NAME,SIZE,MODEL | grep -E '^[a-z]'
+        echo ""
+    fi
+done
+
+# Configure mkinitcpio with error handling
 print_header "INITRAMFS CONFIGURATION"
-# Backup original
-cp /etc/mkinitcpio.conf /etc/mkinitcpio.conf.backup
+if cp /etc/mkinitcpio.conf /etc/mkinitcpio.conf.backup; then
+    print_info "Backup created: /etc/mkinitcpio.conf.backup"
+else
+    print_warning "Failed to create backup of mkinitcpio.conf"
+fi
 
-# Replace the HOOKS line
-sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt keyboard keymap consolefont lvm2 filesystems fsck)/' /etc/mkinitcpio.conf
+# Replace the HOOKS line with error handling
+if sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt keyboard keymap consolefont lvm2 filesystems fsck)/' /etc/mkinitcpio.conf; then
+    print_success "mkinitcpio configured"
+else
+    print_error "Failed to configure mkinitcpio"
+    exit 1
+fi
 
-# Generate initramfs
-print_success "mkinitcpio configured and initramfs generated"
-
-# Configure GRUB
+# Configure GRUB with better error handling
 print_header "BOOTLOADER CONFIGURATION"
 
 # Determine which partition contains the encrypted LVM
@@ -611,24 +695,40 @@ else
     fi
 fi
 
-# Get UUIDs
-CRYPT_UUID=$(blkid -s UUID -o value "$CRYPT_PARTITION")
-ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volRoot)
-SWAP_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volSwap)
+# Get UUIDs with better error handling
+print_info "Detecting partition UUIDs..."
+CRYPT_UUID=$(blkid -s UUID -o value "$CRYPT_PARTITION" 2>/dev/null)
+ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volRoot 2>/dev/null)
+SWAP_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volSwap 2>/dev/null)
 
-if [[ -z "$CRYPT_UUID" || -z "$ROOT_UUID" ]]; then
-    print_error "Could not determine UUIDs. Please check your setup."
+if [[ -z "$CRYPT_UUID" ]]; then
+    print_error "Could not determine UUID for encrypted partition: $CRYPT_PARTITION"
+    print_error "Please check that the partition exists and is properly formatted."
     exit 1
+fi
+
+if [[ -z "$ROOT_UUID" ]]; then
+    print_error "Could not determine UUID for root partition: /dev/mapper/lvmSystem-volRoot"
+    print_error "Please check that the LVM volume exists and is properly formatted."
+    exit 1
+fi
+
+if [[ -z "$SWAP_UUID" ]]; then
+    print_warning "Could not determine UUID for swap partition. Continuing without swap resume."
 fi
 
 print_info "Found UUIDs:"
 echo "  Encrypted partition: $CRYPT_UUID"
 echo "  Root partition: $ROOT_UUID"
-echo "  Swap partition: $SWAP_UUID"
+[[ -n "$SWAP_UUID" ]] && echo "  Swap partition: $SWAP_UUID"
 echo "  Boot encrypted: $BOOT_ENCRYPTED"
 
 # Backup original GRUB config
-cp /etc/default/grub /etc/default/grub.backup
+if cp /etc/default/grub /etc/default/grub.backup; then
+    print_info "GRUB configuration backed up"
+else
+    print_warning "Failed to backup GRUB configuration"
+fi
 
 # Configure GRUB command line
 GRUB_CMDLINE="cryptdevice=UUID=${CRYPT_UUID}:lvm-system:allow-discards root=UUID=${ROOT_UUID} loglevel=3 quiet"
@@ -637,11 +737,16 @@ if [[ -n "$SWAP_UUID" ]]; then
 fi
 GRUB_CMDLINE="${GRUB_CMDLINE} net.ifnames=0"
 
-# FIXED: Escape special characters and use safer delimiters
+# Escape special characters and use safer delimiters
 GRUB_CMDLINE_ESCAPED=$(printf '%s\n' "$GRUB_CMDLINE" | sed 's/[[\.*^$()+?{|]/\\&/g')
 
 # Update GRUB configuration with safer sed commands
-sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE_ESCAPED}\"|" /etc/default/grub
+if sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE_ESCAPED}\"|" /etc/default/grub; then
+    print_info "GRUB command line updated"
+else
+    print_error "Failed to update GRUB command line"
+    exit 1
+fi
 
 # Only enable cryptodisk for encrypted boot
 if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
@@ -666,21 +771,29 @@ fi
 
 # Ask user to confirm or override
 echo "Detected boot mode: $BOOT_MODE"
-read -p "Is this correct? (y/n): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "1) UEFI"
-    echo "2) Legacy BIOS"
-    read -p "Select boot mode (1 or 2): " -n 1 -r
+while true; do
+    read -p "Is this correct? (y/n): " -n 1 -r
     echo
-    case $REPLY in
-        1) BOOT_MODE="UEFI" ;;
-        2) BOOT_MODE="Legacy" ;;
-        *) print_error "Invalid selection"; exit 1 ;;
-    esac
-fi
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        break
+    elif [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo "1) UEFI"
+        echo "2) Legacy BIOS"
+        while true; do
+            read -p "Select boot mode (1 or 2): " -n 1 -r
+            echo
+            case $REPLY in
+                1) BOOT_MODE="UEFI"; break 2 ;;
+                2) BOOT_MODE="Legacy"; break 2 ;;
+                *) print_error "Invalid selection. Please enter 1 or 2." ;;
+            esac
+        done
+    else
+        print_error "Please answer 'y' for yes or 'n' for no."
+    fi
+done
 
-# Install GRUB
+# Install GRUB with error handling
 print_info "Installing GRUB for $BOOT_MODE system..."
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     # Check if /boot is mounted and is EFI system partition
@@ -688,29 +801,74 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
         print_error "/boot is not mounted. Please mount your EFI system partition to /boot"
         exit 1
     fi
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=artix --recheck
+    if grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=artix --recheck; then
+        print_success "GRUB installed for UEFI"
+    else
+        print_error "Failed to install GRUB for UEFI"
+        exit 1
+    fi
 else
-    grub-install --target=i386-pc --boot-directory=/boot --bootloader-id=artix --recheck /dev/$DISK_NAME
+    if grub-install --target=i386-pc --boot-directory=/boot --bootloader-id=artix --recheck /dev/$DISK_NAME; then
+        print_success "GRUB installed for Legacy BIOS"
+    else
+        print_error "Failed to install GRUB for Legacy BIOS"
+        exit 1
+    fi
 fi
 
-# Generate GRUB config
-grub-mkconfig -o /boot/grub/grub.cfg
-print_success "GRUB installed and configured"
+# Generate GRUB config with error handling
+if grub-mkconfig -o /boot/grub/grub.cfg; then
+    print_success "GRUB configuration generated"
+else
+    print_error "Failed to generate GRUB configuration"
+    exit 1
+fi
 
-# Set root password
+# Set root password with retry logic
 print_header "ROOT PASSWORD"
-while ! passwd; do
-    print_error "Failed to set password. Please try again."
+while true; do
+    if passwd; then
+        print_success "Root password set successfully"
+        break
+    else
+        print_error "Failed to set password. Please try again."
+        read -p "Do you want to try again? (y/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_warning "Skipping root password setup. You can set it later with 'passwd' command."
+            break
+        fi
+    fi
 done
 
-# Enable NetworkManager
+# Enable NetworkManager with error handling
 print_info "Enabling NetworkManager..."
-ln -s /etc/runit/sv/NetworkManager /etc/runit/runsvdir/default/
-print_success "NetworkManager enabled"
+if ln -s /etc/runit/sv/NetworkManager /etc/runit/runsvdir/default/ 2>/dev/null; then
+    print_success "NetworkManager enabled"
+else
+    if [[ -L /etc/runit/runsvdir/default/NetworkManager ]]; then
+        print_warning "NetworkManager is already enabled"
+    else
+        print_error "Failed to enable NetworkManager"
+        exit 1
+    fi
+fi
 
 print_success "Chroot configuration completed!"
+
+# Generate initramfs with error handling
 print_header "Recompiling Kernel"
-mkinitcpio -P
+if mkinitcpio -P; then
+    print_success "Kernel initramfs generated successfully"
+else
+    print_error "Failed to generate initramfs"
+    exit 1
+fi
+
+print_success "All configuration completed successfully!"
+echo ""
+print_info "You can now exit the chroot environment and reboot your system."
+print_info "Remember to remove the installation media before rebooting."
 
 CHROOT_EOF
 
