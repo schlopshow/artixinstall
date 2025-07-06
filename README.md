@@ -1,13 +1,5 @@
 # Artix Linux Complete Installation Script
 
-A comprehensive, automated installation script for Artix Linux with full disk encryption using LUKS and LVM.
-
-## ⚠️ WARNING
-
-**This script will completely erase the selected disk and all data on it. Make sure you have backups of any important data before running this script.**
-
-## Features
-
 ### Security Features
 - **Full Disk Encryption** with LUKS1
 - **Serpent-XTS-Plain64** cipher (512-bit key)
@@ -131,14 +123,6 @@ sync
 ## License
 
 This script is provided as-is for educational and personal use. Use at your own risk.
-
-## Contributing
-
-Feel free to submit issues, suggestions, or improvements. Always test changes in a virtual machine first.
-
-## Disclaimer
-
-This script performs destructive operations on disk drives. The authors are not responsible for any data loss or system damage. Always backup important data and test in a virtual environment first.
 
 
 ## To Do List
