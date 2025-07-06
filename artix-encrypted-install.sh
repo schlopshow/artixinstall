@@ -15,10 +15,15 @@ NC='\033[0m' # No Color
 
 # Global variables
 DISK=""
+DISK_NAME=""
 BOOT_SIZE=""
 SWAP_SIZE=""
 SWAP_UUID=""
 BOOT_ENCRYPTED="true"  # Default to encrypted boot
+TIMEZONE=""
+HOSTNAME=""
+REGION=""
+CITY=""
 
 # Output functions
 print_info() {
@@ -80,6 +85,19 @@ validate_disk() {
     [[ -b "/dev/$1" ]]
 }
 
+validate_hostname() {
+    # Check if hostname is valid (RFC 1123)
+    if [[ ${#1} -gt 63 ]]; then
+        print_error "Hostname too long (max 63 characters)"
+        return 1
+    fi
+    if [[ ! "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+        print_error "Invalid hostname format. Use only letters, numbers, and hyphens. Cannot start or end with hyphen."
+        return 1
+    fi
+    return 0
+}
+
 #=============================================================================
 # PHASE 1: DISK ENCRYPTION SETUP
 #=============================================================================
@@ -97,8 +115,10 @@ get_disk_configuration() {
         # Add /dev/ prefix if not present
         if [[ "$disk_input" == /dev/* ]]; then
             DISK="$disk_input"
+            DISK_NAME="${disk_input#/dev/}"
         else
             DISK="/dev/$disk_input"
+            DISK_NAME="$disk_input"
         fi
 
         # Check if disk exists
@@ -156,6 +176,54 @@ get_disk_configuration() {
     fi
 }
 
+get_system_configuration() {
+    print_header "SYSTEM CONFIGURATION"
+
+    # Get timezone
+    echo "Available regions:"
+    ls /usr/share/zoneinfo/ | grep -E '^[A-Z]' | head -10
+    echo "..."
+
+    while true; do
+        get_user_input "Enter your region (e.g., America, Europe, Asia)" REGION
+        if [[ -d "/usr/share/zoneinfo/$REGION" ]]; then
+            break
+        else
+            print_error "Invalid region '$REGION'. Please choose from available regions."
+            echo "Available regions:"
+            ls /usr/share/zoneinfo/ | grep -E '^[A-Z]' | head -20
+            echo "..."
+        fi
+    done
+
+    echo "Available cities in $REGION:"
+    ls "/usr/share/zoneinfo/$REGION" | head -10
+    echo "..."
+
+    while true; do
+        get_user_input "Enter your city" CITY
+        TIMEZONE="$REGION/$CITY"
+
+        if validate_timezone "$TIMEZONE"; then
+            print_success "Timezone will be set to $TIMEZONE"
+            break
+        else
+            print_error "Invalid city '$CITY' for region '$REGION'."
+            echo "Available cities in $REGION:"
+            ls "/usr/share/zoneinfo/$REGION" | head -20
+            echo "..."
+        fi
+    done
+
+    # Get hostname
+    while true; do
+        get_user_input "Enter hostname for this system" HOSTNAME validate_hostname
+        if validate_hostname "$HOSTNAME"; then
+            break
+        fi
+    done
+}
+
 confirm_configuration() {
     print_header "CONFIGURATION SUMMARY"
     echo "Disk: $DISK"
@@ -168,6 +236,8 @@ confirm_configuration() {
     echo "Swap partition size: $SWAP_SIZE"
     echo "Root partition: Uses remaining space"
     echo "Root filesystem: BTRFS"
+    echo "Timezone: $TIMEZONE"
+    echo "Hostname: $HOSTNAME"
     echo ""
 
     lsblk "$DISK"
@@ -474,433 +544,79 @@ install_base_system() {
     print_success "fstab generated"
 }
 
-create_chroot_script() {
-    print_info "Creating chroot configuration script..."
-    cat > /mnt/chroot_config.sh << 'CHROOT_EOF'
-#!/bin/bash
+configure_system() {
+    print_header "SYSTEM CONFIGURATION"
 
-set -e
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_header() { echo -e "${BLUE}===== $1 =====${NC}"; }
-
-get_user_input() {
-    local prompt="$1"
-    local var_name="$2"
-    local validation_func="$3"
-
-    while true; do
-        read -p "$prompt: " input
-        if [[ -n "$input" ]] && ([[ -z "$validation_func" ]] || $validation_func "$input"); then
-            eval "$var_name='$input'"
-            break
-        else
-            print_error "Invalid input. Please try again."
-        fi
-    done
-}
-
-validate_timezone() {
-    [[ -f "/usr/share/zoneinfo/$1" ]]
-}
-
-validate_disk() {
-    [[ -b "/dev/$1" ]]
-}
-
-validate_hostname() {
-    # Check if hostname is valid (RFC 1123)
-    if [[ ${#1} -gt 63 ]]; then
-        print_error "Hostname too long (max 63 characters)"
-        return 1
-    fi
-    if [[ ! "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
-        print_error "Invalid hostname format. Use only letters, numbers, and hyphens. Cannot start or end with hyphen."
-        return 1
-    fi
-    return 0
-}
-
-# Get timezone from user with better error handling
-print_header "TIMEZONE CONFIGURATION"
-echo "Available regions:"
-ls /usr/share/zoneinfo/ | grep -E '^[A-Z]' | head -10
-echo "..."
-
-while true; do
-    get_user_input "Enter your region (e.g., America, Europe, Asia)" REGION
-    if [[ -d "/usr/share/zoneinfo/$REGION" ]]; then
-        break
+    # Set timezone
+    print_info "Setting timezone to $TIMEZONE..."
+    if artix-chroot /mnt ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime; then
+        print_success "Timezone set to $TIMEZONE"
     else
-        print_error "Invalid region '$REGION'. Please choose from available regions."
-        echo "Available regions:"
-        ls /usr/share/zoneinfo/ | grep -E '^[A-Z]' | head -20
-        echo "..."
+        print_error "Failed to set timezone"
+        exit 1
     fi
-done
 
-echo "Available cities in $REGION:"
-ls "/usr/share/zoneinfo/$REGION" | head -10
-echo "..."
-
-while true; do
-    get_user_input "Enter your city" CITY
-    TIMEZONE="$REGION/$CITY"
-
-    if validate_timezone "$TIMEZONE"; then
-        if ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime; then
-            print_success "Timezone set to $TIMEZONE"
-            break
-        else
-            print_error "Failed to set timezone. Please try again."
-        fi
+    # Sync hardware clock
+    print_info "Syncing hardware clock..."
+    if artix-chroot /mnt hwclock --systohc 2>/dev/null; then
+        print_success "Hardware clock synced"
     else
-        print_error "Invalid city '$CITY' for region '$REGION'."
-        echo "Available cities in $REGION:"
-        ls "/usr/share/zoneinfo/$REGION" | head -20
-        echo "..."
+        print_warning "Failed to sync hardware clock. This may not be critical."
     fi
-done
 
-# Sync hardware clock with error handling
-print_info "Syncing hardware clock..."
-if hwclock --systohc 2>/dev/null; then
-    print_success "Hardware clock synced"
-else
-    print_warning "Failed to sync hardware clock. This may not be critical."
-fi
-
-# Set up locale with error handling
-print_header "LOCALE CONFIGURATION"
-if cat > /etc/locale.conf << 'LOCALE_EOF'
+    # Set up locale
+    print_info "Setting up locale..."
+    artix-chroot /mnt /bin/bash -c 'cat > /etc/locale.conf << "LOCALE_EOF"
 LANG=en_US.UTF-8
 export LC_COLLATE="C"
-LOCALE_EOF
-then
-    print_info "Locale configuration file created"
-else
-    print_error "Failed to create locale configuration"
-    exit 1
-fi
+LOCALE_EOF'
 
-if echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; then
-    print_info "Locale added to locale.gen"
-else
-    print_error "Failed to update locale.gen"
-    exit 1
-fi
+    artix-chroot /mnt /bin/bash -c 'echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen'
 
-if locale-gen; then
-    print_success "Locale configured"
-else
-    print_error "Failed to generate locale"
-    exit 1
-fi
-
-# Get hostname with validation
-print_header "HOSTNAME CONFIGURATION"
-while true; do
-    get_user_input "Enter hostname for this system" HOSTNAME validate_hostname
-    if validate_hostname "$HOSTNAME"; then
-        break
+    if artix-chroot /mnt locale-gen; then
+        print_success "Locale configured"
+    else
+        print_error "Failed to generate locale"
+        exit 1
     fi
-done
 
-if echo "$HOSTNAME" > /etc/hostname; then
-    print_info "Hostname file created"
-else
-    print_error "Failed to create hostname file"
-    exit 1
-fi
+    # Set hostname
+    print_info "Setting hostname to $HOSTNAME..."
+    artix-chroot /mnt /bin/bash -c "echo '$HOSTNAME' > /etc/hostname"
 
-# Set up hosts file with error handling
-if cat > /etc/hosts << HOSTS_EOF
+    artix-chroot /mnt /bin/bash -c "cat > /etc/hosts << HOSTS_EOF
 127.0.0.1    localhost
 ::1          localhost
 127.0.1.1    $HOSTNAME.localdomain $HOSTNAME
-HOSTS_EOF
-then
+HOSTS_EOF"
+
     print_success "Hostname set to $HOSTNAME"
-else
-    print_error "Failed to create hosts file"
-    exit 1
-fi
 
-# Get disk for bootloader with better validation
-print_header "DISK CONFIGURATION"
-echo "Available disks:"
-lsblk -d -o NAME,SIZE,MODEL | grep -E '^[a-z]'
-echo ""
+    # Configure mkinitcpio
+    print_info "Configuring mkinitcpio..."
+    artix-chroot /mnt cp /etc/mkinitcpio.conf /etc/mkinitcpio.conf.backup
 
-while true; do
-    get_user_input "Enter the disk device name for bootloader (e.g., sda, nvme0n1)" DISK_NAME
-    if validate_disk "$DISK_NAME"; then
-        print_success "Selected disk: /dev/$DISK_NAME"
-        break
-    else
-        print_error "Invalid disk device '/dev/$DISK_NAME'. Please choose from available disks:"
-        lsblk -d -o NAME,SIZE,MODEL | grep -E '^[a-z]'
-        echo ""
-    fi
-done
+    artix-chroot /mnt sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt keyboard keymap consolefont lvm2 filesystems fsck)/' /etc/mkinitcpio.conf
 
-# Configure mkinitcpio with error handling
-print_header "INITRAMFS CONFIGURATION"
-if cp /etc/mkinitcpio.conf /etc/mkinitcpio.conf.backup; then
-    print_info "Backup created: /etc/mkinitcpio.conf.backup"
-else
-    print_warning "Failed to create backup of mkinitcpio.conf"
-fi
-
-# Replace the HOOKS line with error handling
-if sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt keyboard keymap consolefont lvm2 filesystems fsck)/' /etc/mkinitcpio.conf; then
     print_success "mkinitcpio configured"
-else
-    print_error "Failed to configure mkinitcpio"
-    exit 1
-fi
-
-# Configure GRUB with better error handling
-print_header "BOOTLOADER CONFIGURATION"
-
-# Determine which partition contains the encrypted LVM
-# Check if volBoot exists to determine boot setup
-if lvdisplay /dev/lvmSystem/volBoot &>/dev/null; then
-    BOOT_ENCRYPTED="true"
-    print_info "Detected encrypted boot setup"
-    # Encrypted partition is partition 1
-    if [[ "$DISK_NAME" =~ nvme[0-9]+n[0-9]+ ]]; then
-        CRYPT_PARTITION="/dev/${DISK_NAME}p1"
-    else
-        CRYPT_PARTITION="/dev/${DISK_NAME}1"
-    fi
-else
-    BOOT_ENCRYPTED="false"
-    print_info "Detected unencrypted boot setup"
-    # Encrypted partition is partition 2
-    if [[ "$DISK_NAME" =~ nvme[0-9]+n[0-9]+ ]]; then
-        CRYPT_PARTITION="/dev/${DISK_NAME}p2"
-    else
-        CRYPT_PARTITION="/dev/${DISK_NAME}2"
-    fi
-fi
-
-# Get UUIDs with better error handling
-print_info "Detecting partition UUIDs..."
-CRYPT_UUID=$(blkid -s UUID -o value "$CRYPT_PARTITION" 2>/dev/null)
-ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volRoot 2>/dev/null)
-SWAP_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volSwap 2>/dev/null)
-
-if [[ -z "$CRYPT_UUID" ]]; then
-    print_error "Could not determine UUID for encrypted partition: $CRYPT_PARTITION"
-    print_error "Please check that the partition exists and is properly formatted."
-    exit 1
-fi
-
-if [[ -z "$ROOT_UUID" ]]; then
-    print_error "Could not determine UUID for root partition: /dev/mapper/lvmSystem-volRoot"
-    print_error "Please check that the LVM volume exists and is properly formatted."
-    exit 1
-fi
-
-if [[ -z "$SWAP_UUID" ]]; then
-    print_warning "Could not determine UUID for swap partition. Continuing without swap resume."
-fi
-
-print_info "Found UUIDs:"
-echo "  Encrypted partition: $CRYPT_UUID"
-echo "  Root partition: $ROOT_UUID"
-[[ -n "$SWAP_UUID" ]] && echo "  Swap partition: $SWAP_UUID"
-echo "  Boot encrypted: $BOOT_ENCRYPTED"
-
-# Backup original GRUB config
-if cp /etc/default/grub /etc/default/grub.backup; then
-    print_info "GRUB configuration backed up"
-else
-    print_warning "Failed to backup GRUB configuration"
-fi
-
-# Configure GRUB command line
-GRUB_CMDLINE="cryptdevice=UUID=${CRYPT_UUID}:lvm-system:allow-discards root=UUID=${ROOT_UUID} loglevel=3 quiet"
-if [[ -n "$SWAP_UUID" ]]; then
-    GRUB_CMDLINE="${GRUB_CMDLINE} resume=UUID=${SWAP_UUID}"
-fi
-GRUB_CMDLINE="${GRUB_CMDLINE} net.ifnames=0"
-
-# Escape special characters and use safer delimiters
-GRUB_CMDLINE_ESCAPED=$(printf '%s\n' "$GRUB_CMDLINE" | sed 's/[[\.*^$()+?{|]/\\&/g')
-
-# Update GRUB configuration with safer sed commands
-if sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE_ESCAPED}\"|" /etc/default/grub; then
-    print_info "GRUB command line updated"
-else
-    print_error "Failed to update GRUB command line"
-    exit 1
-fi
-
-# Only enable cryptodisk for encrypted boot
-if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
-    sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos cryptodisk"|' /etc/default/grub
-    sed -i 's|^#GRUB_ENABLE_CRYPTODISK=.*|GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
-else
-    # For unencrypted boot, we don't need cryptodisk in GRUB
-    sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos"|' /etc/default/grub
-    sed -i 's|^GRUB_ENABLE_CRYPTODISK=.*|#GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
-fi
-
-print_success "GRUB configuration updated"
-
-# Determine boot mode
-if [[ -d /sys/firmware/efi/efivars ]]; then
-    BOOT_MODE="UEFI"
-    print_info "UEFI system detected"
-else
-    BOOT_MODE="Legacy"
-    print_info "Legacy BIOS system detected"
-fi
-
-# Ask user to confirm or override
-echo "Detected boot mode: $BOOT_MODE"
-while true; do
-    read -p "Is this correct? (y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        break
-    elif [[ $REPLY =~ ^[Nn]$ ]]; then
-        echo "1) UEFI"
-        echo "2) Legacy BIOS"
-        while true; do
-            read -p "Select boot mode (1 or 2): " -n 1 -r
-            echo
-            case $REPLY in
-                1) BOOT_MODE="UEFI"; break 2 ;;
-                2) BOOT_MODE="Legacy"; break 2 ;;
-                *) print_error "Invalid selection. Please enter 1 or 2." ;;
-            esac
-        done
-    else
-        print_error "Please answer 'y' for yes or 'n' for no."
-    fi
-done
-
-# Install GRUB with error handling
-print_info "Installing GRUB for $BOOT_MODE system..."
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    # Check if /boot is mounted and is EFI system partition
-    if ! mountpoint -q /boot; then
-        print_error "/boot is not mounted. Please mount your EFI system partition to /boot"
-        exit 1
-    fi
-    if grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=artix --recheck; then
-        print_success "GRUB installed for UEFI"
-    else
-        print_error "Failed to install GRUB for UEFI"
-        exit 1
-    fi
-else
-    if grub-install --target=i386-pc --boot-directory=/boot --bootloader-id=artix --recheck /dev/$DISK_NAME; then
-        print_success "GRUB installed for Legacy BIOS"
-    else
-        print_error "Failed to install GRUB for Legacy BIOS"
-        exit 1
-    fi
-fi
-
-# Generate GRUB config with error handling
-if grub-mkconfig -o /boot/grub/grub.cfg; then
-    print_success "GRUB configuration generated"
-else
-    print_error "Failed to generate GRUB configuration"
-    exit 1
-fi
-
-# Set root password with retry logic
-print_header "ROOT PASSWORD"
-while true; do
-    if passwd; then
-        print_success "Root password set successfully"
-        break
-    else
-        print_error "Failed to set password. Please try again."
-        read -p "Do you want to try again? (y/n): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            print_warning "Skipping root password setup. You can set it later with 'passwd' command."
-            break
-        fi
-    fi
-done
-
-# Enable NetworkManager with error handling
-print_info "Enabling NetworkManager..."
-if ln -s /etc/runit/sv/NetworkManager /etc/runit/runsvdir/default/ 2>/dev/null; then
-    print_success "NetworkManager enabled"
-else
-    if [[ -L /etc/runit/runsvdir/default/NetworkManager ]]; then
-        print_warning "NetworkManager is already enabled"
-    else
-        print_error "Failed to enable NetworkManager"
-        exit 1
-    fi
-fi
-
-print_success "Chroot configuration completed!"
-
-# Generate initramfs with error handling
-print_header "Recompiling Kernel"
-if mkinitcpio -P; then
-    print_success "Kernel initramfs generated successfully"
-else
-    print_error "Failed to generate initramfs"
-    exit 1
-fi
-
-print_success "All configuration completed successfully!"
-echo ""
-print_info "You can now exit the chroot environment and reboot your system."
-print_info "Remember to remove the installation media before rebooting."
-
-CHROOT_EOF
-
-    # Make the chroot script executable
-    chmod +x /mnt/chroot_config.sh
 }
 
-execute_chroot_configuration() {
-    # Execute the chroot script
-    print_info "Entering chroot environment for system configuration..."
-    artix-chroot /mnt /chroot_config.sh
+configure_bootloader() {
+    print_header "BOOTLOADER CONFIGURATION"
 
-    # Clean up
-    rm /mnt/chroot_config.sh
-}
-
-show_completion_info() {
-    print_header "INSTALLATION COMPLETED"
-
-    # Determine partition names and layout info
-    local BOOT_INFO
+    # Determine which partition contains the encrypted LVM
     local CRYPT_PARTITION
-
     if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
-        BOOT_INFO="volBoot ($BOOT_SIZE) - FAT32 (encrypted, inside LVM)"
+        print_info "Configuring for encrypted boot setup"
+        # Encrypted partition is partition 1
         if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
             CRYPT_PARTITION="${DISK}p1"
         else
             CRYPT_PARTITION="${DISK}1"
         fi
     else
-        BOOT_INFO="Separate unencrypted partition ($BOOT_SIZE) - FAT32"
+        print_info "Configuring for unencrypted boot setup"
+        # Encrypted partition is partition 2
         if [[ "$DISK" =~ nvme[0-9]+n[0-9]+ ]]; then
             CRYPT_PARTITION="${DISK}p2"
         else
@@ -908,21 +624,197 @@ show_completion_info() {
         fi
     fi
 
-    echo "Disk: $DISK"
-    echo "Encryption: LUKS1 with Serpent-XTS-Plain64 on $CRYPT_PARTITION"
-    echo "LVM Volume Group: lvmSystem"
-    echo "Partitions/Volumes:"
-    echo "  - Boot: $BOOT_INFO"
-    echo "  - volSwap ($SWAP_SIZE)"
-    echo "  - volRoot (remaining space) - BTRFS"
+    # Get UUIDs
+    print_info "Detecting partition UUIDs..."
+    local CRYPT_UUID ROOT_UUID
+    CRYPT_UUID=$(blkid -s UUID -o value "$CRYPT_PARTITION" 2>/dev/null)
+    ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/lvmSystem-volRoot 2>/dev/null)
 
-    print_success "Artix Linux installation completed successfully!"
-    print_info "You can now reboot into your new system."
-
-    if [[ "$BOOT_ENCRYPTED" == "false" ]]; then
-        print_info "Note: Your boot partition is unencrypted for compatibility."
-        print_info "The root and swap partitions are fully encrypted."
+    if [[ -z "$CRYPT_UUID" ]]; then
+        print_error "Could not determine UUID for encrypted partition: $CRYPT_PARTITION"
+        exit 1
     fi
+
+    if [[ -z "$ROOT_UUID" ]]; then
+        print_error "Could not determine UUID for root partition: /dev/mapper/lvmSystem-volRoot"
+        exit 1
+    fi
+
+    print_info "Found UUIDs:"
+    echo "  Encrypted partition: $CRYPT_UUID"
+    echo "  Root partition: $ROOT_UUID"
+    [[ -n "$SWAP_UUID" ]] && echo "  Swap partition: $SWAP_UUID"
+
+    # Configure GRUB
+    artix-chroot /mnt cp /etc/default/grub /etc/default/grub.backup
+
+    # Build GRUB command line
+    local GRUB_CMDLINE="cryptdevice=UUID=${CRYPT_UUID}:lvm-system:allow-discards root=UUID=${ROOT_UUID} loglevel=3 quiet"
+    if [[ -n "$SWAP_UUID" ]]; then
+        GRUB_CMDLINE="${GRUB_CMDLINE} resume=UUID=${SWAP_UUID}"
+    fi
+    GRUB_CMDLINE="${GRUB_CMDLINE} net.ifnames=0"
+
+    # Update GRUB configuration
+    artix-chroot /mnt /bin/bash -c "sed -i \"s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\\\"$GRUB_CMDLINE\\\"|\" /etc/default/grub"
+
+    # Configure cryptodisk based on boot encryption
+    if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+        artix-chroot /mnt sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos cryptodisk"|' /etc/default/grub
+        artix-chroot /mnt sed -i 's|^#GRUB_ENABLE_CRYPTODISK=.*|GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
+    else
+        artix-chroot /mnt sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos"|' /etc/default/grub
+        artix-chroot /mnt sed -i 's|^GRUB_ENABLE_CRYPTODISK=.*|#GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
+    fi
+
+    print_success "GRUB configuration updated"
+
+    # Determine boot mode
+    local BOOT_MODE
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        BOOT_MODE="UEFI"
+        print_info "UEFI system detected"
+    else
+        BOOT_MODE="Legacy"
+        print_info "Legacy BIOS system detected"
+    fi
+
+    # Ask user to confirm or override
+    echo "Detected boot mode: $BOOT_MODE"
+    while true; do
+        read -p "Is this correct? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            break
+        elif [[ $REPLY =~ ^[Nn]$ ]]; then
+            echo "1) UEFI"
+            echo "2) Legacy BIOS"
+            while true; do
+                read -p "Select boot mode (1 or 2): " -n 1 -r
+                echo
+                case $REPLY in
+                    1) BOOT_MODE="UEFI"; break 2 ;;
+                    2) BOOT_MODE="Legacy"; break 2 ;;
+                    *) print_error "Invalid selection. Please enter 1 or 2." ;;
+                esac
+            done
+        else
+            print_error "Please answer 'y' for yes or 'n' for no."
+        fi
+    done
+
+    # Install GRUB
+    print_info "Installing GRUB for $BOOT_MODE system..."
+    if [[ "$BOOT_MODE" == "UEFI" ]]; then
+        if artix-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=artix --recheck; then
+            print_success "GRUB installed for UEFI"
+        else
+            print_error "Failed to install GRUB for UEFI"
+            exit 1
+        fi
+    else
+        if artix-chroot /mnt grub-install --target=i386-pc --boot-directory=/boot --bootloader-id=artix --recheck "/dev/$DISK_NAME"; then
+            print_success "GRUB installed for Legacy BIOS"
+        else
+            print_error "Failed to install GRUB for Legacy BIOS"
+            exit 1
+        fi
+    fi
+
+    # Generate GRUB config
+    if artix-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg; then
+        print_success "GRUB configuration generated"
+    else
+        print_error "Failed to generate GRUB configuration"
+        exit 1
+    fi
+}
+
+configure_user_settings() {
+    print_header "USER SETTINGS"
+
+    # Set root password
+    print_info "Setting root password..."
+    while true; do
+        if artix-chroot /mnt passwd; then
+            print_success "Root password set successfully"
+            break
+        else
+            print_error "Failed to set password. Please try again."
+            read -p "Do you want to try again? (y/n): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                print_warning "Skipping root password setup. You can set it later with 'passwd' command."
+                break
+            fi
+        fi
+    done
+
+    # Enable NetworkManager
+    print_info "Enabling NetworkManager..."
+    if artix-chroot /mnt ln -s /etc/runit/sv/NetworkManager /etc/runit/runsvdir/default/ 2>/dev/null; then
+        print_success "NetworkManager enabled"
+    else
+        if [[ -L /mnt/etc/runit/runsvdir/default/NetworkManager ]]; then
+            print_warning "NetworkManager is already enabled"
+        else
+            print_error "Failed to enable NetworkManager"
+            exit 1
+        fi
+    fi
+
+   artix-chroot /mnt /bin/bash -c "mkinitcpio -P"
+}
+
+
+
+cleanup_and_finish() {
+    print_header "CLEANUP AND FINISH"
+
+    # Unmount partitions
+    print_info "Unmounting partitions..."
+    umount -R /mnt 2>/dev/null || true
+    swapoff -a 2>/dev/null || true
+
+    # Close LUKS container
+    print_info "Closing LUKS container..."
+    cryptsetup luksClose lvm-system 2>/dev/null || true
+
+    # Deactivate LVM
+    print_info "Deactivating LVM..."
+    vgchange -an lvmSystem 2>/dev/null || true
+
+    print_success "Cleanup completed"
+}
+
+show_installation_summary() {
+    print_header "INSTALLATION COMPLETE"
+
+    echo ""
+    print_success "Artix Linux installation completed successfully!"
+    echo ""
+    echo "System Configuration Summary:"
+    echo "  Disk: $DISK"
+    echo "  Boot: $(if [[ "$BOOT_ENCRYPTED" == "true" ]]; then echo "Encrypted"; else echo "Unencrypted"; fi)"
+    echo "  Root filesystem: BTRFS"
+    echo "  Encryption: LUKS1 with Serpent-XTS-Plain64"
+    echo "  Hostname: $HOSTNAME"
+    echo "  Timezone: $TIMEZONE"
+    echo ""
+    echo "Important Notes:"
+    echo "- You will be prompted for your disk encryption password on boot"
+    echo "- NetworkManager is enabled and will start automatically"
+    echo "- Root password has been set"
+    echo "- Additional user account may have been created"
+    echo ""
+    echo "Next Steps:"
+    echo "1. Remove the installation media"
+    echo "2. Reboot the system"
+    echo "3. Log in with root or your user account"
+    echo "4. Configure your system as needed"
+    echo ""
+    print_warning "Make sure to remember your disk encryption password!"
+    echo ""
 }
 
 #=============================================================================
@@ -930,31 +822,30 @@ show_completion_info() {
 #=============================================================================
 
 main() {
-    print_header "ARTIX LINUX COMPLETE INSTALLATION"
-    echo "This script will:"
-    echo "1. Securely erase your selected disk (optional)"
-    echo "2. Create and encrypt partitions with LUKS"
-    echo "3. Set up LVM with boot, swap, and root volumes"
-    echo "4. Format partitions (BTRFS for root, FAT32 for boot)"
-    echo "5. Install base Artix Linux system"
-    echo "6. Configure bootloader and system settings"
+    print_header "ARTIX LINUX ENCRYPTED INSTALLATION"
+    print_info "This script will install Artix Linux with full disk encryption"
+    print_warning "This script will COMPLETELY ERASE the selected disk!"
     echo ""
-    print_warning "This is a destructive operation. Make sure you have backups!"
-    echo ""
+
+    # Check if running as root
+    check_root
 
     # Phase 1: Disk encryption setup
-    check_root
     get_disk_configuration
+    get_system_configuration
     confirm_configuration
-    downgrade_parted
 
-    # Ask about secure erase and perform accordingly
+    # Optional secure erase
     if ask_secure_erase; then
         erase_disk
     else
         quick_erase
     fi
 
+    # Downgrade parted to avoid issues
+    downgrade_parted
+
+    # Set up disk encryption
     create_partitions
     setup_encryption
     setup_lvm
@@ -963,23 +854,20 @@ main() {
 
     # Phase 2: System installation
     install_base_system
-    create_chroot_script
-    execute_chroot_configuration
+    configure_system
+    configure_bootloader
+    configure_user_settings
 
-    # Show completion information
-    show_completion_info
+    # Cleanup and finish
+    cleanup_and_finish
+    show_installation_summary
 
-    # Ask about reboot
+    print_success "Installation script completed successfully!"
     echo ""
-    read -p "Would you like to reboot now? (y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Rebooting..."
-        reboot
-    else
-        print_info "Installation completed. Reboot when ready."
-    fi
+    read -p "Press Enter to exit..."
 }
 
-# Run the main function
-main "$@"
+# Run main function if script is executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
