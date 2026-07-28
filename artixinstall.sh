@@ -213,11 +213,8 @@ validate_hostname() {
 # PHASE 0: CONFIGURATION (fully re-editable, nothing destructive happens yet)
 #=============================================================================
 
-get_disk_configuration() {
-    print_header "DISK CONFIGURATION"
+select_disk() {
     show_available_disks
-
-    # --- Disk selection ---
     while true; do
         local disk_input=""
         read -r -p "Enter the disk to use (e.g. sda, vda, nvme0n1): " disk_input
@@ -255,8 +252,13 @@ get_disk_configuration() {
                 continue
             fi
         fi
-        break
+        return 0
     done
+}
+
+get_disk_configuration() {
+    print_header "DISK CONFIGURATION"
+    select_disk
 
     # --- Boot partition style ---
     print_header "BOOT PARTITION CONFIGURATION"
@@ -724,27 +726,190 @@ mount_partitions() {
 }
 
 #=============================================================================
+# RESUME: reuse a disk that has already been partitioned/encrypted/formatted
+#=============================================================================
+
+resume_existing_install() {
+    print_header "RESUME AN EXISTING SETUP"
+    echo "Use this if a previous run got as far as encrypting and formatting the"
+    echo "disk but failed later (package conflict, network drop, power loss)."
+    echo "Nothing on the disk will be erased."
+    echo ""
+
+    select_disk
+
+    # Find the LUKS container
+    local target="" p
+    for p in "$(part 1)" "$(part 2)"; do
+        [[ -b "$p" ]] || continue
+        if cryptsetup isLuks "$p" 2>/dev/null; then
+            target="$p"
+            break
+        fi
+    done
+
+    if [[ -z "$target" ]]; then
+        print_error "No LUKS container found on $DISK."
+        print_info "You will need a fresh installation instead."
+        return 1
+    fi
+
+    print_success "Found LUKS container on $target"
+
+    if [[ "$target" == "$(part 1)" ]]; then
+        BOOT_ENCRYPTED="true"
+        print_info "Layout: encrypted /boot inside LVM."
+    else
+        BOOT_ENCRYPTED="false"
+        print_info "Layout: separate unencrypted boot on $(part 1)."
+    fi
+
+    PART_TABLE=$(blkid -s PTTYPE -o value "$DISK" 2>/dev/null || echo "unknown")
+
+    # Open the container, retrying on a wrong passphrase
+    if [[ -e "/dev/mapper/$LUKS_NAME" ]]; then
+        print_info "Container is already open."
+    else
+        while true; do
+            print_info "Enter the passphrase for $target"
+            if cryptsetup luksOpen "$target" "$LUKS_NAME"; then
+                break
+            fi
+            print_error "Wrong passphrase or failed to open."
+            ask_yes_no "Try again?" y || return 1
+        done
+    fi
+    STORAGE_TOUCHED=1
+
+    print_info "Activating volume group $VG_NAME..."
+    if ! vgchange -ay "$VG_NAME" >/dev/null; then
+        print_error "Could not activate $VG_NAME."
+        return 1
+    fi
+
+    local vol
+    for vol in volRoot volSwap; do
+        if [[ ! -e "/dev/$VG_NAME/$vol" ]]; then
+            print_error "Expected logical volume $vol is missing."
+            return 1
+        fi
+    done
+    if [[ "$BOOT_ENCRYPTED" == "true" && ! -e "/dev/$VG_NAME/volBoot" ]]; then
+        print_error "Encrypted layout detected but volBoot is missing."
+        return 1
+    fi
+
+    SWAP_UUID=$(blkid -s UUID -o value "/dev/$VG_NAME/volSwap" 2>/dev/null || echo "")
+
+    print_info "Mounting..."
+    mountpoint -q /mnt || mount "/dev/$VG_NAME/volRoot" /mnt || {
+        print_error "Could not mount root."
+        return 1
+    }
+    mkdir -p /mnt/boot
+    if ! mountpoint -q /mnt/boot; then
+        if [[ "$BOOT_ENCRYPTED" == "true" ]]; then
+            mount "/dev/$VG_NAME/volBoot" /mnt/boot || { print_error "Could not mount boot."; return 1; }
+        else
+            mount "$(part 1)" /mnt/boot || { print_error "Could not mount $(part 1)."; return 1; }
+        fi
+    fi
+    swapon "/dev/$VG_NAME/volSwap" 2>/dev/null || true
+
+    print_success "Existing setup mounted at /mnt. Continuing from the package install."
+    echo ""
+
+    if [[ -d /mnt/usr/bin ]]; then
+        print_warning "/mnt already contains an installed system."
+        print_info "Packages will be reinstalled over it; existing files are kept."
+    fi
+
+    return 0
+}
+
+#=============================================================================
 # PHASE 2: SYSTEM INSTALLATION
 #=============================================================================
+
+BASE_PACKAGES=(
+    base base-devel
+    linux linux-headers linux-firmware
+    runit elogind elogind-runit
+    grub efibootmgr
+    networkmanager networkmanager-runit
+    cryptsetup lvm2 lvm2-runit mkinitcpio
+    btrfs-progs dosfstools
+    vim nano sudo
+)
+
+# Extra pacman arguments carried between basestrap attempts (e.g. --overwrite).
+BASESTRAP_EXTRA_ARGS=()
+
+refresh_databases() {
+    print_info "Refreshing package databases on the live system..."
+    pacman -Sy --noconfirm >/dev/null 2>&1 \
+        && print_success "Databases refreshed." \
+        || print_warning "pacman -Sy failed; continuing with the databases on the ISO."
+}
+
+# Turn "/mnt/usr/share/libalpm/hooks/30-binfmt.hook exists in both 'a' and 'b'"
+# into an --overwrite glob relative to the new root.
+extract_conflicting_paths() {
+    local log="$1"
+    grep -oE '^/[^[:space:]]+ exists in (both|filesystem)' "$log" 2>/dev/null \
+        | awk '{print $1}' \
+        | sed 's|^/mnt||' \
+        | sort -u
+}
 
 install_base_system() {
     print_header "BASE SYSTEM INSTALLATION"
 
     sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
+    refresh_databases
 
+    local log="/tmp/basestrap.log"
     print_info "Installing packages with basestrap (this takes a while)..."
-    if ! basestrap /mnt \
-            base base-devel \
-            linux linux-headers linux-firmware \
-            runit elogind elogind-runit \
-            grub efibootmgr \
-            networkmanager networkmanager-runit \
-            cryptsetup lvm2 lvm2-runit mkinitcpio \
-            btrfs-progs dosfstools \
-            vim nano sudo; then
-        print_error "basestrap failed."
-        print_info "Check your network connection and mirrors, then retry."
-        print_info "Sometimes 'pacman -Sy artix-keyring archlinux-keyring' fixes signature errors."
+
+    basestrap /mnt ${BASESTRAP_EXTRA_ARGS[@]+"${BASESTRAP_EXTRA_ARGS[@]}"} "${BASE_PACKAGES[@]}" 2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+
+    if (( rc == 0 )); then
+        print_success "Packages installed."
+    else
+        echo ""
+        print_error "basestrap failed (exit $rc)."
+
+        # --- File-conflict recovery ---
+        if grep -q "conflicting files\|exists in both\|exists in filesystem" "$log"; then
+            local paths
+            paths=$(extract_conflicting_paths "$log")
+            print_warning "This is a pacman file conflict, not a network problem."
+            print_info "Two packages ship the same file. This happens on Artix when the"
+            print_info "package databases on the ISO are older than the ones in the repos."
+            if [[ -n "$paths" ]]; then
+                echo ""
+                print_info "Conflicting paths:"
+                echo "$paths" | sed 's/^/  /'
+            fi
+            echo ""
+            print_info "Overwriting these files is safe when they are pacman hooks or"
+            print_info "service links; the last package to write simply wins."
+            if ask_yes_no "Retry with --overwrite for the conflicting paths?" y; then
+                local glob
+                if [[ -n "$paths" ]]; then
+                    glob=$(echo "$paths" | paste -sd, -)
+                else
+                    glob='/usr/share/libalpm/hooks/*,/etc/runit/runsvdir/default/*'
+                fi
+                BASESTRAP_EXTRA_ARGS=(--overwrite "$glob")
+                print_info "Next attempt will use: --overwrite '$glob'"
+            fi
+        else
+            print_info "Check your network connection and mirrors."
+            print_info "Signature errors can often be fixed with:"
+            print_info "  pacman -Sy artix-keyring archlinux-keyring"
+        fi
         return 1
     fi
 
@@ -1059,30 +1224,50 @@ main() {
     check_dependencies || die "Missing dependencies."
     detect_firmware
 
-    # --- Configuration loop: nothing destructive happens here ---
+    # --- Fresh install or resume? ---
+    local mode=""
+    echo "1. New installation (erases a disk)"
+    echo "2. Resume an existing encrypted setup (disk already partitioned/formatted)"
+    echo ""
     while true; do
-        get_disk_configuration
-        get_system_configuration
-        confirm_configuration && break
-        print_info "Starting configuration over..."
-        echo ""
+        read -r -p "Select (1 or 2): " mode
+        case "$mode" in
+            1|2) break ;;
+            *) print_error "Enter 1 or 2." ;;
+        esac
     done
 
-    # --- Erase ---
-    if ask_secure_erase; then
-        retry_step "Secure erase" erase_disk || die "Secure erase aborted."
+    if [[ "$mode" == "2" ]]; then
+        if ! retry_step "Resume existing setup" resume_existing_install; then
+            die "Could not resume. Re-run and choose a new installation."
+        fi
+        get_system_configuration
     else
-        retry_step "Quick erase" quick_erase || die "Quick erase aborted."
+        # --- Configuration loop: nothing destructive happens here ---
+        while true; do
+            get_disk_configuration
+            get_system_configuration
+            confirm_configuration && break
+            print_info "Starting configuration over..."
+            echo ""
+        done
+
+        # --- Erase ---
+        if ask_secure_erase; then
+            retry_step "Secure erase" erase_disk || die "Secure erase aborted."
+        else
+            retry_step "Quick erase" quick_erase || die "Quick erase aborted."
+        fi
+
+        downgrade_parted
+
+        # --- Disk preparation ---
+        retry_step "Partitioning"     create_partitions || die "Partitioning aborted."
+        retry_step "Encryption setup" setup_encryption  || die "Encryption aborted."
+        retry_step "LVM setup"        setup_lvm         || die "LVM setup aborted."
+        retry_step "Formatting"       format_partitions || die "Formatting aborted."
+        retry_step "Mounting"         mount_partitions  || die "Mounting aborted."
     fi
-
-    downgrade_parted
-
-    # --- Disk preparation ---
-    retry_step "Partitioning"        create_partitions  || die "Partitioning aborted."
-    retry_step "Encryption setup"    setup_encryption   || die "Encryption aborted."
-    retry_step "LVM setup"           setup_lvm          || die "LVM setup aborted."
-    retry_step "Formatting"          format_partitions  || die "Formatting aborted."
-    retry_step "Mounting"            mount_partitions   || die "Mounting aborted."
 
     # --- Installation ---
     retry_step "Base system install" install_base_system || die "Base install aborted."
