@@ -842,8 +842,11 @@ BASE_PACKAGES=(
     vim nano sudo
 )
 
-# Extra pacman arguments carried between basestrap attempts (e.g. --overwrite).
-BASESTRAP_EXTRA_ARGS=()
+# Which installation strategy to use on the next attempt.
+#   1 = basestrap, one transaction (normal)
+#   2 = direct pacman, init installed first, then the rest with --overwrite
+INSTALL_STRATEGY=1
+OVERWRITE_GLOB='/usr/share/libalpm/hooks/*'
 
 refresh_databases() {
     print_info "Refreshing package databases on the live system..."
@@ -862,54 +865,130 @@ extract_conflicting_paths() {
         | sort -u
 }
 
+# Everything basestrap does before it calls pacman: bind the API filesystems
+# into the target and give it a mirrorlist and a keyring.
+prepare_target_root() {
+    print_info "Preparing /mnt for a direct pacman install..."
+    mkdir -p /mnt/{proc,sys,dev,run,var/lib/pacman,etc/pacman.d} || return 1
+
+    mountpoint -q /mnt/proc || mount --types proc /proc /mnt/proc || return 1
+    if ! mountpoint -q /mnt/sys; then
+        mount --rbind /sys /mnt/sys && mount --make-rslave /mnt/sys || return 1
+    fi
+    if ! mountpoint -q /mnt/dev; then
+        mount --rbind /dev /mnt/dev && mount --make-rslave /mnt/dev || return 1
+    fi
+    if ! mountpoint -q /mnt/run; then
+        mount --rbind /run /mnt/run && mount --make-rslave /mnt/run || return 1
+    fi
+
+    [[ -f /etc/pacman.d/mirrorlist ]] && cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/
+    if [[ -d /etc/pacman.d/gnupg && ! -d /mnt/etc/pacman.d/gnupg ]]; then
+        cp -a /etc/pacman.d/gnupg /mnt/etc/pacman.d/
+    fi
+    return 0
+}
+
+# Strategy 2: two transactions.
+#
+# "file exists in both 'runit' and 'base'" cannot be cleared with --overwrite,
+# because both packages are in the same transaction and pacman refuses outright.
+# Installing the init on its own first turns the second conflict into an
+# ordinary "exists in filesystem (owned by runit)", which --overwrite does clear.
+install_split_transaction() {
+    local log="$1" rc=0
+
+    prepare_target_root || return 1
+
+    print_info "Step 1/2: installing the init (runit) in its own transaction..."
+    pacman -r /mnt -Sy --noconfirm runit 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    if (( rc != 0 )); then
+        print_error "Could not install runit on its own."
+        return "$rc"
+    fi
+    print_success "runit installed."
+
+    print_info "Step 2/2: installing the remaining packages with --overwrite..."
+    pacman -r /mnt -S --noconfirm --overwrite "$OVERWRITE_GLOB" \
+        "${BASE_PACKAGES[@]}" 2>&1 | tee -a "$log"
+    return "${PIPESTATUS[0]}"
+}
+
+run_package_install() {
+    local log="$1"
+    if (( INSTALL_STRATEGY == 2 )); then
+        install_split_transaction "$log"
+        return $?
+    fi
+    print_info "Installing packages with basestrap (this takes a while)..."
+    basestrap /mnt "${BASE_PACKAGES[@]}" 2>&1 | tee "$log"
+    return "${PIPESTATUS[0]}"
+}
+
 install_base_system() {
     print_header "BASE SYSTEM INSTALLATION"
 
     sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
     refresh_databases
 
-    local log="/tmp/basestrap.log"
-    print_info "Installing packages with basestrap (this takes a while)..."
-
-    basestrap /mnt ${BASESTRAP_EXTRA_ARGS[@]+"${BASESTRAP_EXTRA_ARGS[@]}"} "${BASE_PACKAGES[@]}" 2>&1 | tee "$log"
-    local rc=${PIPESTATUS[0]}
+    local log="/tmp/basestrap.log" rc=0
+    run_package_install "$log"
+    rc=$?
 
     if (( rc == 0 )); then
         print_success "Packages installed."
+        print_info "Verifying the init is present..."
+        if [[ -x /mnt/sbin/runit-init || -x /mnt/usr/bin/runit-init ]]; then
+            print_success "runit is installed."
+        else
+            print_warning "runit-init not found in /mnt. Check the install before rebooting."
+        fi
     else
         echo ""
-        print_error "basestrap failed (exit $rc)."
+        print_error "Package installation failed (exit $rc)."
+        print_info "Full output saved to $log"
 
-        # --- File-conflict recovery ---
-        if grep -q "conflicting files\|exists in both\|exists in filesystem" "$log"; then
+        # --- File conflict between two packages in one transaction ---
+        if grep -q "exists in both" "$log"; then
             local paths
             paths=$(extract_conflicting_paths "$log")
-            print_warning "This is a pacman file conflict, not a network problem."
-            print_info "Two packages ship the same file. This happens on Artix when the"
-            print_info "package databases on the ISO are older than the ones in the repos."
+            print_warning "Two packages in the same transaction ship the same file."
             if [[ -n "$paths" ]]; then
-                echo ""
                 print_info "Conflicting paths:"
                 echo "$paths" | sed 's/^/  /'
+                OVERWRITE_GLOB=$(echo "$paths" | paste -sd, -)
             fi
             echo ""
-            print_info "Overwriting these files is safe when they are pacman hooks or"
-            print_info "service links; the last package to write simply wins."
-            if ask_yes_no "Retry with --overwrite for the conflicting paths?" y; then
-                local glob
-                if [[ -n "$paths" ]]; then
-                    glob=$(echo "$paths" | paste -sd, -)
-                else
-                    glob='/usr/share/libalpm/hooks/*,/etc/runit/runsvdir/default/*'
-                fi
-                BASESTRAP_EXTRA_ARGS=(--overwrite "$glob")
-                print_info "Next attempt will use: --overwrite '$glob'"
-            fi
-        else
-            print_info "Check your network connection and mirrors."
-            print_info "Signature errors can often be fixed with:"
-            print_info "  pacman -Sy artix-keyring archlinux-keyring"
+            print_info "pacman refuses this outright, and --overwrite cannot clear it."
+            print_info "The fix is to install the init first, on its own, then the rest"
+            print_info "with --overwrite. The next attempt will do exactly that."
+            INSTALL_STRATEGY=2
+            return 1
         fi
+
+        # --- Ordinary filesystem conflict ---
+        if grep -q "exists in filesystem" "$log"; then
+            local paths
+            paths=$(extract_conflicting_paths "$log")
+            [[ -n "$paths" ]] && OVERWRITE_GLOB=$(echo "$paths" | paste -sd, -)
+            print_warning "Files on disk are not owned by the packages being installed."
+            print_info "The next attempt will use --overwrite '$OVERWRITE_GLOB'."
+            INSTALL_STRATEGY=2
+            return 1
+        fi
+
+        # --- Signature / keyring ---
+        if grep -qiE "signature|keyring|invalid or corrupted package" "$log"; then
+            print_warning "This looks like a signature or keyring problem."
+            if ask_yes_no "Refresh the keyrings and retry?" y; then
+                pacman -Sy --noconfirm artix-keyring archlinux-keyring || true
+                pacman-key --populate artix archlinux 2>/dev/null || true
+            fi
+            return 1
+        fi
+
+        print_info "Check your network connection and mirrors."
         return 1
     fi
 
