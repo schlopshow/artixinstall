@@ -1,0 +1,1207 @@
+#!/bin/bash
+#=============================================================================
+#  Artix Linux installer -- runit + LUKS1 + LVM + BTRFS
+#
+#  Layouts (following the Artix "Installation with Full Disk Encryption" wiki):
+#
+#    CaseA  plain /boot partition, everything else inside LUKS
+#           sdX1  FAT32 /boot (or ESP on UEFI)
+#           sdX2  LUKS -> LVM -> volSwap, volRoot
+#
+#    CaseB  full disk encryption, /boot inside the LUKS container
+#           sdX1  LUKS -> LVM -> volBoot, volSwap, volRoot
+#           BIOS/MBR only: UEFI firmware cannot read an encrypted ESP.
+#
+#  Root is BTRFS with @ and @home (and @snapshots) subvolumes.
+#
+#  Design notes:
+#    * No 'set -e'. Every fallible command is checked, and every step can be
+#      retried without restarting the installer.
+#    * Packages are installed in two transactions (init first, then base) to
+#      avoid the runit/base file conflict. See install_packages().
+#    * The script can resume onto a disk it already prepared.
+#
+#  Read this before you run it. It will destroy the disk you point it at.
+#=============================================================================
+
+set -uo pipefail
+
+#-----------------------------------------------------------------------------
+# Constants
+#-----------------------------------------------------------------------------
+readonly LUKS_MAPPER="lvm-system"
+readonly VG="lvmSystem"
+readonly LOG="/tmp/artix-install.log"
+
+readonly INIT_PACKAGES=(runit elogind elogind-runit)
+
+readonly BASE_PACKAGES=(
+    base base-devel
+    linux linux-headers linux-firmware
+    mkinitcpio
+    cryptsetup lvm2 lvm2-runit
+    device-mapper
+    btrfs-progs dosfstools
+    grub
+    networkmanager networkmanager-runit
+    sudo vim nano
+)
+
+#-----------------------------------------------------------------------------
+# Globals
+#-----------------------------------------------------------------------------
+DISK=""            # /dev/sda
+LAYOUT=""          # A or B
+FIRMWARE=""        # UEFI or BIOS
+PTABLE=""          # gpt or msdos
+BOOT_SIZE="1G"
+SWAP_SIZE="8G"
+KEYMAP="us"
+TIMEZONE=""
+HOSTNAME_NEW=""
+USERNAME=""
+CIPHER="serpent-xts-plain64"
+BTRFS_OPTS="noatime,compress=zstd:3,space_cache=v2"
+SWAP_UUID=""
+LUKS_UUID=""
+ROOT_UUID=""
+MOUNTED=0          # 1 once anything is mounted / opened
+
+#-----------------------------------------------------------------------------
+# Output
+#-----------------------------------------------------------------------------
+readonly C_RED=$'\033[0;31m'
+readonly C_GRN=$'\033[0;32m'
+readonly C_YEL=$'\033[1;33m'
+readonly C_BLU=$'\033[0;34m'
+readonly C_OFF=$'\033[0m'
+
+log()      { printf '%s\n' "$*" >> "$LOG" 2>/dev/null || true; }
+info()     { printf '%s[INFO]%s %s\n'    "$C_BLU" "$C_OFF" "$*"; log "[INFO] $*"; }
+ok()       { printf '%s[ OK ]%s %s\n'    "$C_GRN" "$C_OFF" "$*"; log "[ OK ] $*"; }
+warn()     { printf '%s[WARN]%s %s\n'    "$C_YEL" "$C_OFF" "$*"; log "[WARN] $*"; }
+err()      { printf '%s[FAIL]%s %s\n'    "$C_RED" "$C_OFF" "$*"; log "[FAIL] $*"; }
+header()   { printf '\n%s===== %s =====%s\n' "$C_BLU" "$*" "$C_OFF"; log "== $* =="; }
+
+#-----------------------------------------------------------------------------
+# Error handling
+#-----------------------------------------------------------------------------
+
+# Release everything we hold on the target disk so the installer can be re-run.
+release_target() {
+    umount -R /mnt 2>/dev/null
+    swapoff -a 2>/dev/null
+    vgchange -an "$VG" >/dev/null 2>&1
+    cryptsetup close "$LUKS_MAPPER" 2>/dev/null
+    return 0
+}
+
+on_exit() {
+    local code=$?
+    if (( code != 0 )); then
+        printf '\n'
+        err "Installer stopped (exit $code)."
+        if (( MOUNTED == 1 )); then
+            info "Releasing the target disk..."
+            release_target
+            info "Done. The disk layout is intact -- re-run and choose Resume."
+        fi
+        info "Log: $LOG"
+    fi
+}
+trap on_exit EXIT
+trap 'printf "\n"; warn "Interrupted."; exit 130' INT
+
+abort() { err "$1"; exit 1; }
+
+#-----------------------------------------------------------------------------
+# Input helpers
+#-----------------------------------------------------------------------------
+
+# ask "Question?" [y|n]   -> 0 for yes, 1 for no
+ask() {
+    local q="$1" def="${2:-y}" ans hint
+    [[ "$def" == y ]] && hint="Y/n" || hint="y/N"
+    while true; do
+        read -r -p "$q ($hint): " ans || ans=""
+        ans="${ans,,}"
+        [[ -z "$ans" ]] && ans="$def"
+        case "$ans" in
+            y|yes) return 0 ;;
+            n|no)  return 1 ;;
+            *)     err "Answer y or n." ;;
+        esac
+    done
+}
+
+# ask_value VARNAME "Prompt" "default"
+ask_value() {
+    local __name="$1" __prompt="$2" __def="${3:-}" __in=""
+    if [[ -n "$__def" ]]; then
+        read -r -p "$__prompt [$__def]: " __in || __in=""
+        [[ -z "$__in" ]] && __in="$__def"
+    else
+        read -r -p "$__prompt: " __in || __in=""
+    fi
+    printf -v "$__name" '%s' "$__in"
+}
+
+# menu VARNAME "Prompt" "opt1" "opt2" ...   -> sets VARNAME to the index (1-based)
+menu() {
+    local __name="$1" __prompt="$2"; shift 2
+    local -a opts=("$@")
+    local i choice
+    for i in "${!opts[@]}"; do
+        printf '  %d) %s\n' $((i+1)) "${opts[i]}"
+    done
+    while true; do
+        read -r -p "$__prompt (1-${#opts[@]}): " choice || choice=""
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#opts[@]} )); then
+            printf -v "$__name" '%s' "$choice"
+            return 0
+        fi
+        err "Enter a number between 1 and ${#opts[@]}."
+    done
+}
+
+# step "Description" command...   -> retries interactively until it works
+step() {
+    local desc="$1"; shift
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+        printf '\n'
+        err "Step failed: $desc"
+        ask "Retry?" y || return 1
+        printf '\n'
+    done
+}
+
+#-----------------------------------------------------------------------------
+# Small utilities
+#-----------------------------------------------------------------------------
+
+# Partition path: /dev/sda + 1 -> /dev/sda1 ; /dev/nvme0n1 + 1 -> /dev/nvme0n1p1
+part() {
+    if [[ "$DISK" =~ [0-9]$ ]]; then
+        printf '%sp%s' "$DISK" "$1"
+    else
+        printf '%s%s' "$DISK" "$1"
+    fi
+}
+
+# Partition holding the LUKS container, per layout.
+luks_part() {
+    if [[ "$LAYOUT" == B ]]; then part 1; else part 2; fi
+}
+
+valid_size()     { [[ "$1" =~ ^[0-9]+[GMK]$ ]]; }
+valid_hostname() { [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; }
+valid_username() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+
+# "16G" -> mebibytes
+size_mib() {
+    local s="${1^^}" n="${1%[GgMmKk]}"
+    case "${s: -1}" in
+        G) echo $(( 10#$n * 1024 )) ;;
+        M) echo $(( 10#$n )) ;;
+        K) echo $(( 10#$n / 1024 )) ;;
+        *) echo 0 ;;
+    esac
+}
+
+wait_for_dev() {
+    local dev="$1" i
+    for ((i = 0; i < 15; i++)); do
+        [[ -b "$dev" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+microcode_package() {
+    case "$(grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null)" in
+        *GenuineIntel*) echo intel-ucode ;;
+        *AuthenticAMD*) echo amd-ucode ;;
+        *)              echo "" ;;
+    esac
+}
+
+is_ssd() {
+    local base
+    base=$(basename "$DISK")
+    [[ "$(cat "/sys/block/$base/queue/rotational" 2>/dev/null)" == "0" ]]
+}
+
+#=============================================================================
+# PRE-FLIGHT
+#=============================================================================
+
+preflight() {
+    header "PRE-FLIGHT CHECKS"
+
+    (( EUID == 0 )) || abort "Run this script as root."
+
+    local missing=() c
+    for c in parted cryptsetup pvcreate vgcreate lvcreate mkfs.btrfs mkfs.fat \
+             mkswap blkid lsblk wipefs basestrap fstabgen artix-chroot; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    if (( ${#missing[@]} )); then
+        err "Missing commands: ${missing[*]}"
+        info "pacman -Sy artools cryptsetup lvm2 parted dosfstools btrfs-progs"
+        return 1
+    fi
+    ok "All required tools present."
+
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        FIRMWARE="UEFI"
+    else
+        FIRMWARE="BIOS"
+    fi
+    ok "Firmware: $FIRMWARE"
+
+    if ping -c1 -W3 artixlinux.org >/dev/null 2>&1; then
+        ok "Network is up."
+    else
+        warn "Could not reach artixlinux.org. The package install will fail without network."
+        ask "Continue anyway?" n || return 1
+    fi
+
+    return 0
+}
+
+#=============================================================================
+# CONFIGURATION  (nothing destructive happens in this section)
+#=============================================================================
+
+choose_disk() {
+    echo "Available disks:"
+    lsblk -dno NAME,SIZE,MODEL | sed 's/^/  /'
+    echo ""
+
+    local input
+    while true; do
+        ask_value input "Target disk (e.g. sda, vda, nvme0n1)" ""
+        [[ -z "$input" ]] && { err "Nothing entered."; continue; }
+        [[ "$input" == /dev/* ]] && DISK="$input" || DISK="/dev/$input"
+
+        if [[ ! -b "$DISK" ]]; then
+            err "$DISK is not a block device."
+            continue
+        fi
+        if [[ "$(lsblk -dno TYPE "$DISK" 2>/dev/null)" != "disk" ]]; then
+            err "$DISK is not a whole disk."
+            continue
+        fi
+        if lsblk -no MOUNTPOINT "$DISK" 2>/dev/null | grep -q '[^[:space:]]'; then
+            warn "$DISK currently has mounted partitions -- it may be your live media:"
+            lsblk -o NAME,SIZE,MOUNTPOINT "$DISK" | sed 's/^/  /'
+            ask "Use it anyway?" n || continue
+        fi
+        return 0
+    done
+}
+
+choose_layout() {
+    header "DISK LAYOUT"
+    echo "  A) Plain /boot partition, everything else encrypted"
+    echo "     Faster boot, one passphrase prompt. Works on UEFI and BIOS."
+    echo ""
+    echo "  B) Full disk encryption, /boot inside the LUKS container"
+    echo "     GRUB asks for the passphrase, then the initramfs asks again."
+    echo "     BIOS/MBR only -- UEFI firmware cannot read an encrypted ESP."
+    echo ""
+
+    local sel
+    while true; do
+        menu sel "Layout" "CaseA - plain /boot" "CaseB - full disk encryption"
+        if (( sel == 1 )); then
+            LAYOUT=A
+        else
+            if [[ "$FIRMWARE" == UEFI ]]; then
+                warn "This machine booted in UEFI mode."
+                warn "CaseB only boots if you switch the firmware to legacy/CSM mode."
+                ask "Choose CaseB anyway?" n || continue
+            fi
+            LAYOUT=B
+        fi
+        break
+    done
+
+    # Partition table follows the firmware, except CaseB which is MBR by nature.
+    if [[ "$LAYOUT" == A && "$FIRMWARE" == UEFI ]]; then
+        PTABLE="gpt"
+    else
+        PTABLE="msdos"
+    fi
+    ok "Layout $LAYOUT on a $PTABLE partition table."
+}
+
+choose_sizes() {
+    header "PARTITION SIZES"
+
+    local disk_mib mem_mib
+    disk_mib=$(( $(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0) / 1048576 ))
+    mem_mib=$(( $(grep -m1 MemTotal /proc/meminfo | awk '{print $2}') / 1024 ))
+    info "Disk: ${disk_mib} MiB    RAM: ${mem_mib} MiB"
+
+    while true; do
+        ask_value BOOT_SIZE "Boot size" "1G"
+        [[ "$BOOT_SIZE" =~ ^[0-9]+$ ]] && BOOT_SIZE="${BOOT_SIZE}G"
+        BOOT_SIZE="${BOOT_SIZE^^}"
+        valid_size "$BOOT_SIZE" || { err "Use a form like 1G, 512M."; continue; }
+        if (( $(size_mib "$BOOT_SIZE") < 512 )); then
+            warn "Under 512 MiB gets tight once you have a few kernels."
+            ask "Keep $BOOT_SIZE?" n || continue
+        fi
+        break
+    done
+
+    local suggested="$(( (mem_mib + 1023) / 1024 ))G"
+    while true; do
+        ask_value SWAP_SIZE "Swap size (>= RAM if you want hibernation)" "$suggested"
+        [[ "$SWAP_SIZE" =~ ^[0-9]+$ ]] && SWAP_SIZE="${SWAP_SIZE}G"
+        SWAP_SIZE="${SWAP_SIZE^^}"
+        valid_size "$SWAP_SIZE" || { err "Use a form like 8G, 512M."; continue; }
+        local need=$(( $(size_mib "$BOOT_SIZE") + $(size_mib "$SWAP_SIZE") + 8192 ))
+        if (( disk_mib > 0 && need > disk_mib )); then
+            err "boot + swap + 8 GiB root = ${need} MiB, disk is only ${disk_mib} MiB."
+            continue
+        fi
+        break
+    done
+}
+
+choose_locale_settings() {
+    header "SYSTEM SETTINGS"
+
+    ask_value KEYMAP "Console keymap" "us"
+    if ! localectl list-keymaps >/dev/null 2>&1; then
+        [[ -n "$(find /usr/share/kbd/keymaps -name "${KEYMAP}.map.gz" 2>/dev/null | head -1)" ]] \
+            || warn "Keymap '$KEYMAP' not found under /usr/share/kbd/keymaps -- continuing anyway."
+    fi
+
+    while true; do
+        ask_value TIMEZONE "Timezone (Region/City)" "${TIMEZONE:-America/Edmonton}"
+        if [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]]; then
+            break
+        fi
+        if [[ -d "/usr/share/zoneinfo/$TIMEZONE" ]]; then
+            err "'$TIMEZONE' is a region, not a zone. It contains:"
+            ls "/usr/share/zoneinfo/$TIMEZONE" | head -30 | sed 's/^/  /'
+            continue
+        fi
+        err "Not a valid timezone. Close matches:"
+        find /usr/share/zoneinfo -type f -printf '%P\n' 2>/dev/null \
+            | grep -i -- "${TIMEZONE##*/}" | head -12 | sed 's/^/  /'
+    done
+
+    while true; do
+        ask_value HOSTNAME_NEW "Hostname" "${HOSTNAME_NEW:-artix}"
+        valid_hostname "$HOSTNAME_NEW" && break
+        err "Letters, digits and hyphens only; must not start or end with a hyphen."
+    done
+
+    while true; do
+        ask_value USERNAME "Username for the non-root account (blank to skip)" ""
+        [[ -z "$USERNAME" ]] && break
+        valid_username "$USERNAME" && break
+        err "Lowercase letters, digits, '-' and '_', starting with a letter."
+    done
+}
+
+confirm_plan() {
+    header "SUMMARY"
+    local mc; mc=$(microcode_package)
+    is_ssd && BTRFS_OPTS="${BTRFS_OPTS},discard=async"
+
+    echo "  Disk           $DISK  ($PTABLE, $(is_ssd && echo SSD || echo HDD))"
+    echo "  Firmware       $FIRMWARE"
+    if [[ "$LAYOUT" == A ]]; then
+        echo "  Layout         CaseA -- plain /boot"
+        echo "    $(part 1)      FAT32 boot, $BOOT_SIZE"
+        echo "    $(part 2)      LUKS1 -> LVM"
+    else
+        echo "  Layout         CaseB -- full disk encryption"
+        echo "    $(part 1)      LUKS1 -> LVM (boot inside)"
+        echo "    volBoot      FAT32, $BOOT_SIZE"
+    fi
+    echo "    volSwap      swap, $SWAP_SIZE"
+    echo "    volRoot      BTRFS, remaining space"
+    echo "  Subvolumes     @, @home, @snapshots"
+    echo "  Mount options  $BTRFS_OPTS"
+    echo "  Cipher         $CIPHER (LUKS1, sha512, 512-bit key)"
+    echo "  Init           runit"
+    echo "  Microcode      ${mc:-none detected}"
+    echo "  Keymap         $KEYMAP"
+    echo "  Timezone       $TIMEZONE"
+    echo "  Hostname       $HOSTNAME_NEW"
+    echo "  User           ${USERNAME:-root only}"
+    echo ""
+    lsblk "$DISK" | sed 's/^/  /'
+    echo ""
+    warn "Everything on $DISK will be destroyed."
+    echo ""
+
+    local sel
+    menu sel "Choose" "Install" "Change the settings" "Quit"
+    case "$sel" in
+        1) return 0 ;;
+        2) return 1 ;;
+        3) info "Cancelled."; exit 0 ;;
+    esac
+}
+
+gather_configuration() {
+    while true; do
+        header "TARGET DISK"
+        choose_disk
+        choose_layout
+        choose_sizes
+        choose_locale_settings
+        confirm_plan && return 0
+        info "Starting over."
+    done
+}
+
+#=============================================================================
+# DISK PREPARATION
+#=============================================================================
+
+wipe_disk() {
+    header "ERASING $DISK"
+    echo "  1) Quick   -- clear the partition table and signatures (seconds)"
+    echo "  2) Secure  -- overwrite the whole disk with random data (hours)"
+    echo ""
+    local sel
+    menu sel "Erase method" "Quick" "Secure"
+
+    release_target
+    wipefs -a "$DISK" >/dev/null 2>&1
+
+    if (( sel == 2 )); then
+        info "Overwriting $DISK. This cannot be interrupted safely -- let it finish."
+        # openssl keystream is far faster than /dev/urandom and just as opaque.
+        local key; key=$(head -c64 /dev/urandom | base64 -w0)
+        openssl enc -aes-256-ctr -pass "pass:$key" -nosalt </dev/zero 2>/dev/null \
+            | dd bs=64K of="$DISK" oflag=direct status=progress 2>&1 \
+            | grep -v 'No space left on device'
+        sync
+        ok "Disk overwritten."
+    else
+        dd if=/dev/zero of="$DISK" bs=1M count=16 status=none 2>/dev/null
+        local sz; sz=$(blockdev --getsize64 "$DISK")
+        if (( sz > 33554432 )); then
+            dd if=/dev/zero of="$DISK" bs=1M count=16 \
+               seek=$(( sz / 1048576 - 16 )) status=none 2>/dev/null
+        fi
+        sync
+        ok "Partition table and signatures cleared."
+    fi
+    return 0
+}
+
+# The Artix wiki errata: parted 3.6 makes grub-install report "unknown filesystem".
+offer_parted_downgrade() {
+    header "PARTED VERSION"
+    local ver; ver=$(parted --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    info "Installed parted: ${ver:-unknown}"
+    echo "The Artix FDE wiki notes that parted 3.6 can cause 'grub-install: error:"
+    echo "unknown filesystem'. Downgrading to 3.4-2 avoids it, but needs network."
+    echo ""
+    if ask "Downgrade parted to 3.4-2?" n; then
+        if pacman -U --noconfirm \
+            "https://archive.artixlinux.org/packages/p/parted/parted-3.4-2-x86_64.pkg.tar.zst"; then
+            ok "parted downgraded."
+        else
+            warn "Downgrade failed. Continuing with parted ${ver:-unknown}."
+        fi
+    fi
+    return 0
+}
+
+create_partitions() {
+    header "PARTITIONING"
+
+    parted -s "$DISK" mklabel "$PTABLE" || { err "mklabel $PTABLE failed."; return 1; }
+
+    if [[ "$LAYOUT" == A ]]; then
+        if [[ "$PTABLE" == gpt ]]; then
+            parted -s -a optimal "$DISK" mkpart ESP fat32 1MiB "$BOOT_SIZE" || return 1
+            parted -s "$DISK" set 1 esp on || return 1
+            parted -s -a optimal "$DISK" mkpart cryptlvm "$BOOT_SIZE" 100% || return 1
+        else
+            parted -s -a optimal "$DISK" mkpart primary fat32 1MiB "$BOOT_SIZE" || return 1
+            parted -s "$DISK" set 1 boot on || return 1
+            parted -s -a optimal "$DISK" mkpart primary "$BOOT_SIZE" 100% || return 1
+        fi
+        parted -s "$DISK" set 2 lvm on || return 1
+    else
+        parted -s -a optimal "$DISK" mkpart primary 1MiB 100% || return 1
+        parted -s "$DISK" set 1 boot on || return 1
+        parted -s "$DISK" set 1 lvm on || return 1
+    fi
+
+    partprobe "$DISK" 2>/dev/null
+    sync
+    sleep 1
+
+    wait_for_dev "$(part 1)" || { err "$(part 1) never appeared."; return 1; }
+    if [[ "$LAYOUT" == A ]]; then
+        wait_for_dev "$(part 2)" || { err "$(part 2) never appeared."; return 1; }
+    fi
+
+    echo ""
+    parted -s "$DISK" print
+    parted -s "$DISK" align-check optimal 1 >/dev/null 2>&1 \
+        && ok "Partition 1 optimally aligned." \
+        || warn "Partition 1 is not optimally aligned."
+    ok "Partitions created."
+    return 0
+}
+
+setup_luks() {
+    header "ENCRYPTION"
+
+    local target; target="$(luks_part)"
+    [[ -b "$target" ]] || { err "$target does not exist."; return 1; }
+
+    # Loading the serpent module is what 'cryptsetup benchmark' is really for here.
+    if ! grep -q serpent /proc/crypto; then
+        modprobe serpent_generic 2>/dev/null
+    fi
+    if ! grep -q serpent /proc/crypto; then
+        warn "Serpent is unavailable in this kernel."
+        if ask "Use aes-xts-plain64 instead?" y; then
+            CIPHER="aes-xts-plain64"
+        else
+            return 1
+        fi
+    fi
+
+    info "Creating the LUKS1 container on $target"
+    warn "Type YES in capital letters at the confirmation prompt."
+    warn "There is no recovery if you forget this passphrase."
+    echo ""
+
+    while true; do
+        if cryptsetup --verbose --type luks1 --cipher "$CIPHER" --key-size 512 \
+                      --hash sha512 --iter-time 10000 --use-random \
+                      --verify-passphrase luksFormat "$target"; then
+            ok "LUKS container created."
+            break
+        fi
+        err "luksFormat failed -- passphrases did not match, or YES was not capitalised."
+        ask "Try again?" y || return 1
+        echo ""
+    done
+
+    while true; do
+        info "Now unlock it with the passphrase you just set."
+        if cryptsetup open "$target" "$LUKS_MAPPER"; then
+            MOUNTED=1
+            ok "Unlocked at /dev/mapper/$LUKS_MAPPER"
+            break
+        fi
+        err "Wrong passphrase."
+        ask "Try again?" y || return 1
+    done
+
+    LUKS_UUID=$(blkid -s UUID -o value "$target")
+    [[ -n "$LUKS_UUID" ]] || { err "Could not read the LUKS UUID."; return 1; }
+    return 0
+}
+
+setup_lvm() {
+    header "LVM"
+
+    if vgs "$VG" >/dev/null 2>&1; then
+        warn "Volume group '$VG' already exists."
+        ask "Destroy and recreate it?" y || return 1
+        vgchange -an "$VG" >/dev/null 2>&1
+        vgremove -f "$VG" >/dev/null 2>&1
+        pvremove -ff -y "/dev/mapper/$LUKS_MAPPER" >/dev/null 2>&1
+    fi
+
+    pvcreate -ff -y "/dev/mapper/$LUKS_MAPPER" || { err "pvcreate failed."; return 1; }
+    vgcreate "$VG" "/dev/mapper/$LUKS_MAPPER"  || { err "vgcreate failed."; return 1; }
+
+    # --contiguous is nice for the boot volume but not worth failing over.
+    if [[ "$LAYOUT" == B ]]; then
+        lvcreate --contiguous y --size "$BOOT_SIZE" "$VG" --name volBoot 2>/dev/null \
+            || lvcreate --size "$BOOT_SIZE" "$VG" --name volBoot \
+            || { err "Could not create volBoot ($BOOT_SIZE)."; return 1; }
+    fi
+    lvcreate --contiguous y --size "$SWAP_SIZE" "$VG" --name volSwap 2>/dev/null \
+        || lvcreate --size "$SWAP_SIZE" "$VG" --name volSwap \
+        || { err "Could not create volSwap ($SWAP_SIZE)."; return 1; }
+    lvcreate --extents +100%FREE "$VG" --name volRoot \
+        || { err "Could not create volRoot."; return 1; }
+
+    echo ""
+    lvs "$VG"
+    ok "Logical volumes created."
+    return 0
+}
+
+format_volumes() {
+    header "FILESYSTEMS"
+
+    local boot_dev
+    if [[ "$LAYOUT" == B ]]; then boot_dev="/dev/$VG/volBoot"; else boot_dev="$(part 1)"; fi
+
+    mkfs.fat -F32 -n BOOT "$boot_dev" || { err "mkfs.fat failed on $boot_dev."; return 1; }
+    ok "Boot: FAT32 on $boot_dev"
+
+    mkswap -L SWAP "/dev/$VG/volSwap" >/dev/null || { err "mkswap failed."; return 1; }
+    SWAP_UUID=$(blkid -s UUID -o value "/dev/$VG/volSwap")
+    [[ -n "$SWAP_UUID" ]] || warn "No swap UUID -- hibernation will be disabled."
+    ok "Swap: /dev/$VG/volSwap"
+
+    mkfs.btrfs -f -L ROOT "/dev/$VG/volRoot" >/dev/null || { err "mkfs.btrfs failed."; return 1; }
+    ROOT_UUID=$(blkid -s UUID -o value "/dev/$VG/volRoot")
+    ok "Root: BTRFS on /dev/$VG/volRoot"
+    return 0
+}
+
+create_subvolumes() {
+    header "BTRFS SUBVOLUMES"
+
+    mount "/dev/$VG/volRoot" /mnt || { err "Could not mount volRoot."; return 1; }
+    MOUNTED=1
+
+    local sv
+    for sv in @ @home @snapshots; do
+        if ! btrfs subvolume create "/mnt/$sv" >/dev/null; then
+            err "Could not create subvolume $sv."
+            umount /mnt
+            return 1
+        fi
+    done
+    ok "Created @, @home, @snapshots"
+
+    umount /mnt || { err "Could not unmount /mnt."; return 1; }
+    return 0
+}
+
+mount_target() {
+    header "MOUNTING"
+
+    mount -o "${BTRFS_OPTS},subvol=@" "/dev/$VG/volRoot" /mnt \
+        || { err "Could not mount @ on /mnt."; return 1; }
+    MOUNTED=1
+
+    mkdir -p /mnt/home /mnt/.snapshots /mnt/boot || return 1
+
+    mount -o "${BTRFS_OPTS},subvol=@home" "/dev/$VG/volRoot" /mnt/home \
+        || { err "Could not mount @home."; return 1; }
+    mount -o "${BTRFS_OPTS},subvol=@snapshots" "/dev/$VG/volRoot" /mnt/.snapshots \
+        || { err "Could not mount @snapshots."; return 1; }
+
+    local boot_dev
+    if [[ "$LAYOUT" == B ]]; then boot_dev="/dev/$VG/volBoot"; else boot_dev="$(part 1)"; fi
+    mount "$boot_dev" /mnt/boot || { err "Could not mount $boot_dev on /mnt/boot."; return 1; }
+
+    swapon "/dev/$VG/volSwap" || warn "swapon failed -- continuing without swap."
+
+    echo ""
+    findmnt -R /mnt -o TARGET,SOURCE,FSTYPE,OPTIONS | sed 's/^/  /'
+    ok "Target mounted."
+    return 0
+}
+
+#=============================================================================
+# RESUME  (reuse a disk this script already prepared)
+#=============================================================================
+
+resume_target() {
+    header "RESUME"
+    echo "Reopens a disk that was already partitioned, encrypted and formatted."
+    echo "Nothing is erased."
+    echo ""
+
+    choose_disk
+
+    local target=""
+    local p
+    for p in "$(part 1)" "$(part 2)"; do
+        [[ -b "$p" ]] || continue
+        if cryptsetup isLuks "$p" 2>/dev/null; then target="$p"; break; fi
+    done
+    [[ -n "$target" ]] || { err "No LUKS container found on $DISK."; return 1; }
+
+    if [[ "$target" == "$(part 1)" ]]; then LAYOUT=B; else LAYOUT=A; fi
+    PTABLE=$(blkid -s PTTYPE -o value "$DISK" 2>/dev/null || echo unknown)
+    ok "Found LUKS on $target -- layout $LAYOUT."
+
+    if [[ ! -e "/dev/mapper/$LUKS_MAPPER" ]]; then
+        while true; do
+            info "Unlock $target"
+            cryptsetup open "$target" "$LUKS_MAPPER" && break
+            err "Wrong passphrase."
+            ask "Try again?" y || return 1
+        done
+    fi
+    MOUNTED=1
+
+    vgchange -ay "$VG" >/dev/null || { err "Could not activate $VG."; return 1; }
+
+    local v
+    for v in volRoot volSwap; do
+        [[ -e "/dev/$VG/$v" ]] || { err "Missing logical volume $v."; return 1; }
+    done
+    if [[ "$LAYOUT" == B && ! -e "/dev/$VG/volBoot" ]]; then
+        err "Layout B detected but volBoot is missing."
+        return 1
+    fi
+
+    LUKS_UUID=$(blkid -s UUID -o value "$target")
+    SWAP_UUID=$(blkid -s UUID -o value "/dev/$VG/volSwap" 2>/dev/null || echo "")
+    ROOT_UUID=$(blkid -s UUID -o value "/dev/$VG/volRoot")
+
+    is_ssd && BTRFS_OPTS="${BTRFS_OPTS},discard=async"
+
+    # Reuse the existing subvolumes rather than creating them.
+    if ! mount -o "${BTRFS_OPTS},subvol=@" "/dev/$VG/volRoot" /mnt; then
+        err "Could not mount subvolume @. Was this disk prepared by this script?"
+        return 1
+    fi
+    mkdir -p /mnt/home /mnt/.snapshots /mnt/boot
+    mount -o "${BTRFS_OPTS},subvol=@home" "/dev/$VG/volRoot" /mnt/home 2>/dev/null
+    mount -o "${BTRFS_OPTS},subvol=@snapshots" "/dev/$VG/volRoot" /mnt/.snapshots 2>/dev/null
+
+    local boot_dev
+    if [[ "$LAYOUT" == B ]]; then boot_dev="/dev/$VG/volBoot"; else boot_dev="$(part 1)"; fi
+    mount "$boot_dev" /mnt/boot || { err "Could not mount boot."; return 1; }
+    swapon "/dev/$VG/volSwap" 2>/dev/null
+
+    ok "Target remounted."
+    choose_locale_settings
+    return 0
+}
+
+#=============================================================================
+# PACKAGE INSTALLATION
+#
+#  Artix ships /usr/share/libalpm/hooks/30-binfmt.hook in both 'runit' and
+#  'base'. pacman rejects any single transaction containing both packages, and
+#  --overwrite does not apply to that error. So the init goes in first, on its
+#  own, and the file it installed is removed before 'base' is pulled in.
+#=============================================================================
+
+# Paths pacman named as conflicting, relative to the new root.
+conflicting_paths() {
+    grep -oE '^/[^[:space:]]+ exists in (both|filesystem)' "$1" 2>/dev/null \
+        | awk '{print $1}' | sed 's|^/mnt||' | sort -u
+}
+
+# Delete files in the target that would block the next transaction.
+clear_conflicts() {
+    local logfile="$1" p count=0
+    while read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ -e "/mnt$p" ]]; then
+            rm -f "/mnt$p" && count=$((count + 1))
+            info "  removed /mnt$p"
+        fi
+    done < <(conflicting_paths "$logfile")
+    (( count > 0 ))
+}
+
+basestrap_run() {
+    local logfile="$1"; shift
+    basestrap /mnt "$@" 2>&1 | tee "$logfile"
+    return "${PIPESTATUS[0]}"
+}
+
+install_packages() {
+    header "PACKAGE INSTALLATION"
+
+    sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null
+    info "Refreshing package databases..."
+    pacman -Sy --noconfirm >/dev/null 2>&1 || warn "pacman -Sy failed; using the ISO databases."
+
+    local l1=/tmp/basestrap-init.log
+    local l2=/tmp/basestrap-base.log
+
+    # --- Transaction 1: the init, alone ---
+    info "1/2  Installing runit and elogind..."
+    if ! basestrap_run "$l1" "${INIT_PACKAGES[@]}"; then
+        err "Could not install the init packages."
+        grep -E 'error|conflict' "$l1" | tail -5 | sed 's/^/  /'
+        return 1
+    fi
+    ok "runit installed."
+
+    # 'base' ships this file too; drop runit's copy so base can lay down its own.
+    if [[ -e /mnt/usr/share/libalpm/hooks/30-binfmt.hook ]]; then
+        rm -f /mnt/usr/share/libalpm/hooks/30-binfmt.hook
+        info "Cleared the shared binfmt hook ahead of 'base'."
+    fi
+
+    # --- Transaction 2: everything else ---
+    local -a pkgs=("${BASE_PACKAGES[@]}")
+    local mc; mc=$(microcode_package)
+    [[ -n "$mc" ]] && pkgs+=("$mc")
+    [[ "$FIRMWARE" == UEFI ]] && pkgs+=(efibootmgr)
+
+    info "2/2  Installing the base system (${#pkgs[@]} packages)..."
+    if basestrap_run "$l2" "${pkgs[@]}"; then
+        ok "Base system installed."
+        return 0
+    fi
+
+    # One automatic recovery pass: clear whatever pacman named, then retry.
+    err "basestrap failed."
+    if grep -q 'exists in' "$l2"; then
+        warn "File conflicts reported:"
+        conflicting_paths "$l2" | sed 's/^/  /'
+        if clear_conflicts "$l2"; then
+            info "Retrying..."
+            if basestrap_run "$l2" "${pkgs[@]}"; then
+                ok "Base system installed."
+                return 0
+            fi
+        fi
+    elif grep -qiE 'signature|keyring|corrupted' "$l2"; then
+        warn "Signature or keyring problem."
+        if ask "Refresh the keyrings and retry?" y; then
+            pacman -Sy --noconfirm artix-keyring archlinux-keyring
+            pacman-key --populate artix 2>/dev/null
+            basestrap_run "$l2" "${pkgs[@]}" && { ok "Base system installed."; return 0; }
+        fi
+    fi
+
+    grep -E 'error|warning' "$l2" | tail -8 | sed 's/^/  /'
+    info "Full output: $l2"
+    return 1
+}
+
+generate_fstab() {
+    header "FSTAB"
+    fstabgen -U /mnt > /mnt/etc/fstab || { err "fstabgen failed."; return 1; }
+    [[ -s /mnt/etc/fstab ]] || { err "/mnt/etc/fstab is empty."; return 1; }
+
+    # A btrfs root does not want an fsck pass.
+    sed -i -E 's|(btrfs[[:space:]]+[^[:space:]]+[[:space:]]+0[[:space:]]+)[12]$|\10|' /mnt/etc/fstab
+
+    echo ""
+    grep -v '^#' /mnt/etc/fstab | grep -v '^$' | sed 's/^/  /'
+    ok "fstab written."
+    return 0
+}
+
+#=============================================================================
+# SYSTEM CONFIGURATION
+#=============================================================================
+
+configure_system() {
+    header "SYSTEM CONFIGURATION"
+
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /mnt/etc/localtime || { err "Timezone link failed."; return 1; }
+    artix-chroot /mnt hwclock --systohc 2>/dev/null || warn "hwclock failed (normal in a VM)."
+    ok "Timezone: $TIMEZONE"
+
+    grep -q '^en_US.UTF-8 UTF-8' /mnt/etc/locale.gen 2>/dev/null \
+        || echo 'en_US.UTF-8 UTF-8' >> /mnt/etc/locale.gen
+    printf 'LANG=en_US.UTF-8\n' > /mnt/etc/locale.conf
+    artix-chroot /mnt locale-gen || { err "locale-gen failed."; return 1; }
+    ok "Locale: en_US.UTF-8"
+
+    printf 'KEYMAP=%s\n' "$KEYMAP" > /mnt/etc/vconsole.conf
+    ok "Keymap: $KEYMAP"
+
+    printf '%s\n' "$HOSTNAME_NEW" > /mnt/etc/hostname
+    cat > /mnt/etc/hosts <<EOF
+127.0.0.1	localhost
+::1		localhost
+127.0.1.1	${HOSTNAME_NEW}.localdomain	${HOSTNAME_NEW}
+EOF
+    # Artix reads the hostname from here on some inits.
+    mkdir -p /mnt/etc/conf.d
+    printf 'hostname="%s"\n' "$HOSTNAME_NEW" > /mnt/etc/conf.d/hostname
+    ok "Hostname: $HOSTNAME_NEW"
+
+    return 0
+}
+
+configure_mkinitcpio() {
+    header "INITRAMFS"
+
+    cp /mnt/etc/mkinitcpio.conf /mnt/etc/mkinitcpio.conf.bak 2>/dev/null
+
+    # keyboard and keymap come BEFORE encrypt so a USB keyboard works at the
+    # passphrase prompt. lvm2 comes after encrypt because LVM lives inside LUKS.
+    local hooks="base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt lvm2"
+    [[ -n "$SWAP_UUID" ]] && hooks="$hooks resume"
+    hooks="$hooks filesystems fsck"
+
+    sed -i "s|^MODULES=.*|MODULES=(btrfs)|" /mnt/etc/mkinitcpio.conf || return 1
+    sed -i "s|^HOOKS=.*|HOOKS=($hooks)|" /mnt/etc/mkinitcpio.conf || return 1
+    ok "HOOKS=($hooks)"
+
+    if artix-chroot /mnt mkinitcpio -P; then
+        ok "Initramfs built."
+        return 0
+    fi
+    err "mkinitcpio failed -- the system will not boot without an initramfs."
+    return 1
+}
+
+configure_grub() {
+    header "BOOTLOADER"
+
+    [[ -n "$LUKS_UUID" ]] || { err "LUKS UUID unknown."; return 1; }
+    [[ -n "$ROOT_UUID" ]] || ROOT_UUID=$(blkid -s UUID -o value "/dev/$VG/volRoot")
+    [[ -n "$ROOT_UUID" ]] || { err "Root UUID unknown."; return 1; }
+
+    info "LUKS UUID  $LUKS_UUID"
+    info "Root UUID  $ROOT_UUID"
+    [[ -n "$SWAP_UUID" ]] && info "Swap UUID  $SWAP_UUID"
+
+    local cmdline="cryptdevice=UUID=${LUKS_UUID}:${LUKS_MAPPER}"
+    is_ssd && cmdline="${cmdline}:allow-discards"
+    cmdline="${cmdline} root=UUID=${ROOT_UUID} rootflags=subvol=@"
+    [[ -n "$SWAP_UUID" ]] && cmdline="${cmdline} resume=UUID=${SWAP_UUID}"
+    cmdline="${cmdline} loglevel=3 quiet net.ifnames=0"
+
+    cp /mnt/etc/default/grub /mnt/etc/default/grub.bak 2>/dev/null
+
+    # Rewrite rather than sed-in-place so option order and comments cannot bite us.
+    set_grub() {
+        sed -i -E "/^[#[:space:]]*$1=/d" /mnt/etc/default/grub
+        printf '%s=%s\n' "$1" "$2" >> /mnt/etc/default/grub
+    }
+
+    set_grub GRUB_CMDLINE_LINUX_DEFAULT "\"$cmdline\""
+    set_grub GRUB_TIMEOUT "5"
+    set_grub GRUB_TIMEOUT_STYLE "menu"
+    set_grub GRUB_GFXMODE "auto"
+    set_grub GRUB_DISABLE_OS_PROBER "false"
+
+    if [[ "$LAYOUT" == B ]]; then
+        set_grub GRUB_ENABLE_CRYPTODISK "y"
+        set_grub GRUB_PRELOAD_MODULES "\"part_msdos part_gpt cryptodisk luks lvm btrfs\""
+    else
+        sed -i -E '/^[#[:space:]]*GRUB_ENABLE_CRYPTODISK=/d' /mnt/etc/default/grub
+        set_grub GRUB_PRELOAD_MODULES "\"part_msdos part_gpt lvm btrfs\""
+    fi
+    ok "/etc/default/grub updated."
+
+    info "Installing GRUB for $FIRMWARE..."
+    if [[ "$FIRMWARE" == UEFI ]]; then
+        artix-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot \
+            --bootloader-id=artix --recheck || { err "grub-install failed."; return 1; }
+    else
+        artix-chroot /mnt grub-install --target=i386-pc --boot-directory=/boot \
+            --recheck "$DISK" || { err "grub-install failed."; return 1; }
+    fi
+    ok "GRUB installed."
+
+    artix-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg \
+        || { err "grub-mkconfig failed."; return 1; }
+
+    if ! grep -q "cryptdevice=UUID=$LUKS_UUID" /mnt/boot/grub/grub.cfg; then
+        warn "grub.cfg does not mention the cryptdevice -- check it before rebooting."
+    fi
+    ok "grub.cfg generated."
+    return 0
+}
+
+enable_service() {
+    local name="$1"
+    [[ -d "/mnt/etc/runit/sv/$name" ]] || return 1
+    [[ -L "/mnt/etc/runit/runsvdir/default/$name" ]] && return 0
+    ln -s "/etc/runit/sv/$name" "/mnt/etc/runit/runsvdir/default/$name"
+}
+
+configure_services() {
+    header "RUNIT SERVICES"
+
+    mkdir -p /mnt/etc/runit/runsvdir/default
+
+    local s
+    for s in NetworkManager dbus elogind; do
+        if enable_service "$s"; then
+            ok "enabled $s"
+        else
+            [[ -d "/mnt/etc/runit/sv/$s" ]] && warn "could not enable $s" \
+                                            || info "$s not present, skipping"
+        fi
+    done
+
+    echo ""
+    info "Enabled services:"
+    ls /mnt/etc/runit/runsvdir/default/ 2>/dev/null | sed 's/^/  /'
+    return 0
+}
+
+configure_accounts() {
+    header "ACCOUNTS"
+
+    info "Set the root password."
+    while true; do
+        artix-chroot /mnt passwd root && { ok "Root password set."; break; }
+        err "passwd failed (the two entries probably differed)."
+        ask "Try again?" y || { warn "Root password NOT set."; break; }
+    done
+
+    [[ -z "$USERNAME" ]] && return 0
+
+    if artix-chroot /mnt id "$USERNAME" >/dev/null 2>&1; then
+        info "User '$USERNAME' already exists."
+    else
+        artix-chroot /mnt useradd -m -G wheel,audio,video,storage,input \
+            -s /bin/bash "$USERNAME" || { warn "useradd failed."; return 0; }
+        ok "Created $USERNAME"
+    fi
+
+    info "Set the password for $USERNAME."
+    while true; do
+        artix-chroot /mnt passwd "$USERNAME" && { ok "Password set."; break; }
+        err "passwd failed."
+        ask "Try again?" y || break
+    done
+
+    printf '%%wheel ALL=(ALL:ALL) ALL\n' > /mnt/etc/sudoers.d/10-wheel
+    chmod 0440 /mnt/etc/sudoers.d/10-wheel
+    if artix-chroot /mnt visudo -c >/dev/null 2>&1; then
+        ok "sudo enabled for the wheel group."
+    else
+        rm -f /mnt/etc/sudoers.d/10-wheel
+        warn "sudoers validation failed; sudo rule not added."
+    fi
+    return 0
+}
+
+#=============================================================================
+# FINISH
+#=============================================================================
+
+verify_install() {
+    header "VERIFICATION"
+    local problems=0
+
+    check() {
+        if eval "$2"; then
+            ok "$1"
+        else
+            err "$1"
+            problems=$((problems + 1))
+        fi
+    }
+
+    check "initramfs present"    '[[ -f /mnt/boot/initramfs-linux.img ]]'
+    check "kernel present"       '[[ -f /mnt/boot/vmlinuz-linux ]]'
+    check "grub.cfg present"     '[[ -f /mnt/boot/grub/grub.cfg ]]'
+    check "fstab non-empty"      '[[ -s /mnt/etc/fstab ]]'
+    check "runit init present"   '[[ -x /mnt/usr/bin/runit-init || -x /mnt/sbin/runit-init ]]'
+    check "encrypt hook set"     'grep -q "encrypt" /mnt/etc/mkinitcpio.conf'
+    check "lvm2 hook set"        'grep -q "lvm2" /mnt/etc/mkinitcpio.conf'
+    check "cryptdevice in grub"  'grep -q cryptdevice /mnt/boot/grub/grub.cfg'
+
+    echo ""
+    if (( problems == 0 )); then
+        ok "All checks passed."
+        return 0
+    fi
+    warn "$problems check(s) failed. Fix these before rebooting."
+    return 1
+}
+
+finish() {
+    header "CLEANUP"
+    umount -R /mnt 2>/dev/null
+    swapoff -a 2>/dev/null
+    vgchange -an "$VG" >/dev/null 2>&1
+    cryptsetup close "$LUKS_MAPPER" 2>/dev/null
+    MOUNTED=0
+    ok "Target released."
+
+    header "DONE"
+    cat <<EOF
+
+  Artix is installed on $DISK.
+
+    Layout      Case$LAYOUT ($([[ "$LAYOUT" == B ]] && echo "encrypted /boot" || echo "plain /boot"))
+    Init        runit
+    Root        BTRFS subvolume @ on LVM inside LUKS1 ($CIPHER)
+    Hostname    $HOSTNAME_NEW
+    User        ${USERNAME:-root only}
+
+  At boot:
+$(if [[ "$LAYOUT" == B ]]; then
+    echo "    GRUB asks for the passphrase, then the initramfs asks again."
+    echo "    An embedded keyfile can remove the second prompt later."
+  else
+    echo "    The initramfs asks for the passphrase once."
+  fi)
+
+  Next:
+    1. Remove the install media
+    2. reboot
+    3. Log in and install a desktop, audio and whatever else you want
+
+  Installer log: $LOG
+
+EOF
+    warn "Do not forget the passphrase. There is no way back without it."
+    echo ""
+}
+
+#=============================================================================
+# MAIN
+#=============================================================================
+
+main() {
+    : > "$LOG"
+    header "ARTIX INSTALLER -- runit / LUKS1 / LVM / BTRFS"
+
+    preflight || abort "Pre-flight checks failed."
+
+    local mode
+    echo ""
+    menu mode "Mode" \
+        "Fresh install (erases a disk)" \
+        "Resume (disk already prepared by this script)"
+
+    if (( mode == 2 )); then
+        step "Resume" resume_target || abort "Could not resume."
+    else
+        gather_configuration
+        step "Erase"          wipe_disk         || abort "Erase aborted."
+        offer_parted_downgrade
+        step "Partitioning"   create_partitions || abort "Partitioning aborted."
+        step "Encryption"     setup_luks        || abort "Encryption aborted."
+        step "LVM"            setup_lvm         || abort "LVM aborted."
+        step "Filesystems"    format_volumes    || abort "Formatting aborted."
+        step "Subvolumes"     create_subvolumes || abort "Subvolume creation aborted."
+        step "Mounting"       mount_target      || abort "Mounting aborted."
+    fi
+
+    step "Packages"       install_packages     || abort "Package installation aborted."
+    step "fstab"          generate_fstab       || abort "fstab generation aborted."
+    step "Configuration"  configure_system     || abort "System configuration aborted."
+    step "Initramfs"      configure_mkinitcpio || abort "Initramfs build aborted."
+    step "Bootloader"     configure_grub       || abort "Bootloader aborted."
+    step "Services"       configure_services   || warn "Services not fully enabled."
+    step "Accounts"       configure_accounts   || warn "Accounts not fully configured."
+
+    if ! verify_install; then
+        echo ""
+        ask "Some checks failed. Unmount and finish anyway?" n || {
+            info "Leaving everything mounted at /mnt so you can investigate."
+            info "artix-chroot /mnt   to poke around."
+            MOUNTED=0
+            exit 0
+        }
+    fi
+
+    finish
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
